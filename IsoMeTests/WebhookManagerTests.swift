@@ -307,6 +307,33 @@ final class WebhookManagerTests: XCTestCase {
         XCTAssertNotNil(manager.lastSentAt)
     }
 
+    func testTestConnectionUsesNonLocationProbeWithoutRecordingExportSuccess() async throws {
+        MockWebhookURLProtocol.enqueue(statusCode: 200)
+        let manager = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        manager.urlString = "https://example.com/hooks/location"
+        manager.authType = .none
+        manager.format = .gpx
+        manager.isEnabled = false
+
+        let result = try await manager.testConnection()
+
+        XCTAssertTrue(result.contains("200"))
+        XCTAssertEqual(MockWebhookURLProtocol.requests.count, 1)
+        let request = try XCTUnwrap(MockWebhookURLProtocol.requests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+        XCTAssertNil(request.value(forHTTPHeaderField: "X-WhereDay-Export-ID"))
+        let body = try XCTUnwrap(MockWebhookURLProtocol.postBodies.first)
+        XCTAssertLessThanOrEqual(body.count, 1_024)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(Set(payload.keys), Set(["schema", "schema_version"]))
+        XCTAssertEqual(payload["schema"] as? String, "whereday.connection_probe")
+        XCTAssertEqual(payload["schema_version"] as? Int, 1)
+        XCTAssertNil(manager.lastSentAt)
+        XCTAssertNil(manager.lastStatusCode)
+        XCTAssertEqual(manager.queuedPointCount, 0)
+    }
+
     func testTestConnectionThrowsUnauthorizedFor401() async {
         MockWebhookURLProtocol.enqueue(statusCode: 401)
         let manager = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))

@@ -404,22 +404,16 @@ final class WebhookManager: ObservableObject {
         return outbox
     }
 
-    /// Test the configured endpoint with a minimal payload.
+    /// Check endpoint access without fabricating a location observation.
     func testConnection() async throws -> String {
-        let fakePoint = LocationPoint(
-            latitude: 0,
-            longitude: 0,
-            timestamp: Date(),
-            horizontalAccuracy: 0
-        )
-        let body = try formatPayload(points: [fakePoint])
+        let body = Data(#"{"schema":"whereday.connection_probe","schema_version":1}"#.utf8)
         guard let url = buildURL() else {
             throw WebhookError.invalidURL
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.httpBody = body
-        request.setValue(format.mimeType, forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Whereday/\(AppInfo.version)", forHTTPHeaderField: "User-Agent")
         applyAuth(to: &request)
 
