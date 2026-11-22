@@ -74,22 +74,22 @@ final class WebhookManager: ObservableObject {
         didSet { defaults.set(isEnabled, forKey: Self.key(.enabled)); syncObservation(); syncTimer() }
     }
     @Published var urlString: String {
-        didSet { defaults.set(urlString, forKey: Self.key(.url)) }
+        didSet { defaults.set(urlString, forKey: Self.key(.url)); configurationChanged() }
     }
     @Published var format: ExportFormat {
-        didSet { defaults.set(format.token, forKey: Self.key(.format)) }
+        didSet { defaults.set(format.token, forKey: Self.key(.format)); configurationChanged() }
     }
     @Published var authType: AuthType {
-        didSet { defaults.set(authType.rawValue, forKey: Self.key(.authType)) }
+        didSet { defaults.set(authType.rawValue, forKey: Self.key(.authType)); configurationChanged() }
     }
     @Published var authKey: String {
-        didSet { Self.keychainWriteString(authKey, account: Self.keychainAccount(.authKey)) }
+        didSet { Self.keychainWriteString(authKey, account: Self.keychainAccount(.authKey)); configurationChanged() }
     }
     @Published var authValue: String {
-        didSet { Self.keychainWriteString(authValue, account: Self.keychainAccount(.authValue)) }
+        didSet { Self.keychainWriteString(authValue, account: Self.keychainAccount(.authValue)); configurationChanged() }
     }
     @Published var authUsername: String {
-        didSet { Self.keychainWriteString(authUsername, account: Self.keychainAccount(.authUsername)) }
+        didSet { Self.keychainWriteString(authUsername, account: Self.keychainAccount(.authUsername)); configurationChanged() }
     }
     @Published var sendMode: SendMode {
         didSet { defaults.set(sendMode.rawValue, forKey: Self.key(.sendMode)); syncObservation(); syncTimer() }
@@ -113,15 +113,14 @@ final class WebhookManager: ObservableObject {
     private let defaults: UserDefaults
     private var cancellables = Set<AnyCancellable>()
     private var flushTimer: Timer?
-    private var pendingPoints: [LocationPoint] = []
     private weak var modelContainer: ModelContainer?
+    private weak var attachedLocationManager: LocationManager?
+    private let outbox: WebhookOutbox?
     private var urlSession: URLSession!
     private let retryPolicy: RetryPolicy
     private let sleep: (TimeInterval) async -> Void
-    // Realtime cursor — nil means we haven't observed a tick yet. The first tick
-    // arms the cursor without sending so we never bulk-resend the historical DB
-    // after launch; subsequent ticks send everything strictly newer.
-    private var lastSentTimestamp: Date?
+    private var isFlushing = false
+    private var deliveryActive = false
 
     private enum DefaultsKey: String {
         case enabled, url, format, authType
@@ -140,12 +139,14 @@ final class WebhookManager: ObservableObject {
     init(
         defaults: UserDefaults = .standard,
         urlSession: URLSession? = nil,
+        outboxDirectory: URL? = nil,
         retryPolicy: RetryPolicy = .default,
         sleep: @escaping (TimeInterval) async -> Void = { delay in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
         }
     ) {
         self.defaults = defaults
+        self.outbox = try? WebhookOutbox(directory: outboxDirectory)
         self.retryPolicy = retryPolicy
         self.sleep = sleep
         let d = defaults
@@ -174,6 +175,7 @@ final class WebhookManager: ObservableObject {
             self.urlSession = URLSession(configuration: config)
         }
 
+        refreshQueue()
         syncTimer()
     }
 
@@ -211,16 +213,21 @@ final class WebhookManager: ObservableObject {
     /// Must be called once on app launch so the manager can observe location updates.
     func attach(modelContainer: ModelContainer, locationManager: LocationManager) {
         self.modelContainer = modelContainer
+        self.attachedLocationManager = locationManager
         syncObservation(locationManager: locationManager)
+        Task { @MainActor [weak self] in await self?.resumeAutomaticWork() }
     }
 
     private func syncObservation(locationManager: LocationManager? = nil) {
         cancellables.removeAll()
         guard isEnabled else { return }
 
-        guard let lm = locationManager ?? LocationManager.shared else { return }
+        guard let lm = locationManager ?? attachedLocationManager else { return }
+        armCursorIfNeeded()
 
-        if sendMode == .realtime {
+        // Batch modes need the same native saved-point observation as realtime.
+        // Manual mode resumes only work the user had already prepared.
+        if sendMode != .manual {
             lm.$locationPointsSavedCount
                 .dropFirst()
                 .receive(on: DispatchQueue.main)
@@ -231,6 +238,12 @@ final class WebhookManager: ObservableObject {
                 }
                 .store(in: &cancellables)
         }
+        NotificationCenter.default.publisher(for: .appDidBecomeActive)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                Task { @MainActor in await self?.resumeAutomaticWork() }
+            }
+            .store(in: &cancellables)
     }
 
     private func syncTimer() {
@@ -248,98 +261,147 @@ final class WebhookManager: ObservableObject {
     // MARK: - Sending
 
     private func onNewPoint(locationManager: LocationManager) async {
-        guard let context = modelContainer?.mainContext else { return }
+        guard isEnabled, sendMode != .manual,
+              let context = modelContainer?.mainContext else { return }
         do {
-            switch sendMode {
-            case .realtime:
-                guard let sentinel = lastSentTimestamp else {
-                    lastSentTimestamp = Date()
-                    return
-                }
-                let descriptor = FetchDescriptor<LocationPoint>(
-                    predicate: #Predicate<LocationPoint> { $0.timestamp > sentinel },
-                    sortBy: [SortDescriptor(\.timestamp, order: .forward)]
-                )
-                let newPoints = try context.fetch(descriptor)
-                let showOutliers = UserDefaults.standard.bool(forKey: "showOutliers")
-                let filtered = newPoints.filter { !$0.isOutlier || showOutliers }
-                guard !filtered.isEmpty else { return }
-                try await sendPoints(filtered)
-                if let lastTimestamp = filtered.last?.timestamp {
-                    lastSentTimestamp = lastTimestamp
-                }
-            case .batchCount, .batchTime, .manual:
-                var descriptor = FetchDescriptor<LocationPoint>()
-                descriptor.sortBy = [SortDescriptor(\.timestamp, order: .reverse)]
-                descriptor.fetchLimit = 1
-                let points = try context.fetch(descriptor)
-                guard let latest = points.first else { return }
-
-                if latest.isOutlier && !UserDefaults.standard.bool(forKey: "showOutliers") {
-                    return
-                }
-
-                switch sendMode {
-                case .batchCount:
-                    enqueuePendingPoint(latest)
-                    if pendingPoints.count >= batchCount {
-                        await flushBatch()
-                    }
-                case .batchTime:
-                    enqueuePendingPoint(latest)
-                    // The interval is the schedule; points per batch caps how much waits between ticks.
-                    if pendingPoints.count >= batchCount {
-                        await flushBatch()
-                    }
-                case .manual, .realtime:
-                    break
-                }
+            let request = try configuredRequest(), queue = try requiredOutbox()
+            let state = try queue.read(for: request)
+            guard let cursor = state.cursor else { armCursorIfNeeded(); return }
+            let sentinel = cursor.timestamp
+            let descriptor = FetchDescriptor<LocationPoint>(
+                predicate: #Predicate<LocationPoint> { $0.timestamp >= sentinel },
+                sortBy: [SortDescriptor(\.timestamp, order: .forward)]
+            )
+            let showOutliers = defaults.bool(forKey: "showOutliers")
+            let points = try context.fetch(descriptor).filter {
+                !cursor.includes($0) && (!$0.isOutlier || showOutliers)
+            }
+            let saved = try queue.enqueue(points, for: request)
+            queuedPointCount = saved.queuedPointCount
+            if saved.prepared != nil || sendMode == .realtime || saved.pending.count >= max(1, batchCount) {
+                await flushBatch()
             }
         } catch {
             recordError(error.localizedDescription)
         }
     }
 
-    /// Send all currently queued points (batch flush).
+    /// Each round gives fresh source records first service and visits each
+    /// independent original once. Unknown history retains its exact identity.
     func flushBatch() async {
-        guard !pendingPoints.isEmpty else { return }
-        let batch = pendingPoints
-        pendingPoints.removeAll()
-        do {
-            try await sendPoints(batch)
-            queuedPointCount = pendingPoints.count
-        } catch {
-            pendingPoints.insert(contentsOf: batch, at: 0)
-            queuedPointCount = pendingPoints.count
-            recordError(error.localizedDescription)
+        do { try await drainPrepared() }
+        catch { recordError(error.localizedDescription) }
+        refreshQueue()
+    }
+
+    private func drainPrepared() async throws {
+        guard isEnabled else { throw WebhookOutbox.QueueError.disabled }
+        guard !deliveryActive, !isFlushing else { return }
+        isFlushing = true; isSending = true
+        defer { isFlushing = false; isSending = false; refreshQueue() }
+        let request = try configuredRequest(), queue = try requiredOutbox()
+        var visited = Set<String>()
+        var firstFailure: Error?
+        while true {
+            try validateCurrentSettings(request)
+            try Task.checkCancellation()
+            let points = Array(try queue.unpreparedPoints(for: request).prefix(max(1, batchCount)))
+            if !points.isEmpty {
+                let body = try formatPayload(points: points)
+                _ = try queue.prepare(body: body, points: points, visitCount: 0, for: request)
+            }
+            guard let digest = try queue.nextDigest(for: request, excluding: visited) else { break }
+            visited.insert(digest)
+            do {
+                try queue.activate(digest, for: request)
+                // A historical failure gets one opportunity in this round.
+                // Every continuation still goes through the exact receipt.
+                let history = try queue.read(for: request).prepared?.history == true
+                try await deliverPrepared(request: request, maximumAttempts: history ? 1 : nil)
+            } catch {
+                if firstFailure == nil { firstFailure = error }
+            }
+            await Task.yield()
         }
+        if try queue.damagedOperationCount(for: request) > 0, firstFailure == nil {
+            firstFailure = WebhookOutbox.QueueError.unavailable
+        }
+        if let firstFailure { throw firstFailure }
     }
 
     func enqueuePendingPoint(_ point: LocationPoint) {
-        pendingPoints.append(point)
-        queuedPointCount = pendingPoints.count
+        do {
+            let state = try requiredOutbox().enqueue([point], for: configuredRequest())
+            queuedPointCount = state.queuedPointCount
+        } catch { recordError(error.localizedDescription) }
     }
 
     /// Discards waiting points without sending them. Saved location history is untouched.
     func clearQueue() {
-        let discarded = pendingPoints.count
-        pendingPoints.removeAll()
-        queuedPointCount = 0
-        if discarded > 0 {
-            LogManager.shared.info("Cleared queue · \(discarded) points discarded", category: .webhook)
-        }
+        guard !isSending else { return }
+        do {
+            let state = try requiredOutbox().clearWaiting(for: configuredRequest())
+            queuedPointCount = state.queuedPointCount
+            if state.prepared != nil { recordError(WebhookOutbox.QueueError.recoveryUnavailable.localizedDescription) }
+        } catch { recordError(error.localizedDescription) }
     }
 
-    /// Send a manual export of all saved data.
+    /// Admit fresh rows from the manual snapshot, then resume every independent
+    /// original. Held history never suppresses fetching new saved source rows.
     func sendNow() async {
         guard let context = modelContainer?.mainContext else { return }
         do {
+            let request = try configuredRequest()
+            let history = !(try requiredOutbox().hasHistory(for: request))
             let visits = try context.fetch(FetchDescriptor<Visit>())
             let points = try context.fetch(FetchDescriptor<LocationPoint>())
-            try await sendPoints(points, visits: visits)
+            try await sendPoints(points, visits: visits, history: history)
         } catch {
             recordError(error.localizedDescription)
         }
+    }
+
+    private func resumeAutomaticWork() async {
+        guard isEnabled else { return }
+        if let locationManager = attachedLocationManager, sendMode != .manual {
+            await onNewPoint(locationManager: locationManager)
+        }
+        await flushBatch()
+    }
+
+    private func armCursorIfNeeded() {
+        guard isEnabled, sendMode != .manual, attachedLocationManager != nil, buildURL() != nil else { return }
+        do {
+            let request = try configuredRequest(), queue = try requiredOutbox()
+            var state = try queue.read(for: request)
+            if state.cursor == nil {
+                // Arm at enable/attach, before the first point arrives. Relaunch
+                // reuses the saved cursor; it never skips the first new tick.
+                state.cursor = .init(timestamp: Date(), pointIDs: [])
+                try queue.save(state)
+            }
+        } catch { recordError(error.localizedDescription) }
+    }
+
+    private func configurationChanged() {
+        armCursorIfNeeded()
+        refreshQueue()
+    }
+
+    private func refreshQueue() {
+        guard buildURL() != nil else { queuedPointCount = 0; return }
+        do {
+            let state = try requiredOutbox().read(for: configuredRequest())
+            queuedPointCount = state.queuedPointCount
+            if let date = state.lastSentAt {
+                lastSentAt = date; lastStatusCode = state.lastStatusCode
+            }
+        } catch { recordError(error.localizedDescription) }
+    }
+
+    private func requiredOutbox() throws -> WebhookOutbox {
+        guard let outbox else { throw WebhookOutbox.QueueError.unavailable }
+        return outbox
     }
 
     /// Test the configured endpoint with a minimal payload.
@@ -376,41 +438,205 @@ final class WebhookManager: ObservableObject {
 
     // MARK: - Core send
 
-    private func sendPoints(_ points: [LocationPoint], visits: [Visit] = []) async throws {
-        guard !points.isEmpty else { return }
-        guard let url = buildURL() else {
-            throw WebhookError.invalidURL
+    func sendPoints(_ points: [LocationPoint], visits: [Visit] = [], history: Bool = false) async throws {
+        guard isEnabled else { throw WebhookOutbox.QueueError.disabled }
+        if points.isEmpty && !visits.isEmpty && (format == .owntracks || format == .overland) {
+            throw WebhookOutbox.QueueError.unsupportedVisits
         }
+        let request = try configuredRequest(), queue = try requiredOutbox()
+        let known = try queue.sourceMembership(for: request)
+        let freshPoints = points.filter { !known.points.contains($0.id) }
+        let revisions = try visitRevisions(visits)
+        let selected = visits.indices.filter {
+            !known.unknownVisits && !known.visits.contains(revisions[$0]) && !known.legacyVisits.contains(revisions[$0].sha256)
+        }
+        let freshVisits = selected.map { visits[$0] }
+        if !freshPoints.isEmpty || !freshVisits.isEmpty {
+            let body = try formatPayload(points: freshPoints, visits: freshVisits)
+            _ = try queue.prepare(body: body, points: freshPoints, visitCount: freshVisits.count,
+                                  for: request, history: history, visitRevisions: selected.map { revisions[$0] })
+            refreshQueue()
+        }
+        // Admission above is synchronous and remains available while one HTTP
+        // request is awaiting its response. Its existing drain selects this work
+        // before the next historical operation; never start a second sender.
+        do { try await drainPrepared() }
+        catch {
+            if known.unknownVisits && !visits.isEmpty { throw WebhookOutbox.QueueError.legacyVisitsUnavailable }
+            throw error
+        }
+        if known.unknownVisits && !visits.isEmpty { throw WebhookOutbox.QueueError.legacyVisitsUnavailable }
+    }
 
-        isSending = true
-        defer { isSending = false }
+    private func visitRevisions(_ visits: [Visit]) throws -> [WebhookOutbox.VisitRevision] {
+        guard !visits.isEmpty else { return [] }
+        let body = try ExportService.exportToJSON(visits: visits)
+        guard let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let records = object["visits"] as? [[String: Any]], records.count == visits.count else {
+            throw WebhookOutbox.QueueError.unavailable
+        }
+        return try visits.indices.map {
+            let bytes = try JSONSerialization.data(withJSONObject: records[$0], options: [.sortedKeys])
+            return .init(id: visits[$0].id, sha256: WebhookOutbox.digest(bytes))
+        }
+    }
 
-        let body = try formatPayload(points: points, visits: visits)
+    private func configuredRequest() throws -> URLRequest {
+        guard let url = buildURL() else { throw WebhookError.invalidURL }
+        if authType == .customHeader && ["x-whereday-export-format", "x-whereday-export-id", "x-whereday-export-sha256"].contains(authKey.lowercased()) {
+            throw WebhookOutbox.QueueError.reservedAuthHeader
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.httpBody = body
         request.setValue(format.mimeType, forHTTPHeaderField: "Content-Type")
+        // JSON, OwnTracks and Overland can share a MIME type. Bind their
+        // distinct format tokens too, without storing a credential or endpoint.
+        request.setValue(format.token, forHTTPHeaderField: "X-Whereday-Export-Format")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("Whereday/\(AppInfo.version)", forHTTPHeaderField: "User-Agent")
         applyAuth(to: &request)
+        return request
+    }
 
-        let started = Date()
-        let (_, response) = try await sendRequestWithRetry(request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200...299).contains(httpResponse.statusCode) else {
-            throw WebhookError.httpError((response as? HTTPURLResponse)?.statusCode ?? 0)
+    private func validateCurrentSettings(_ request: URLRequest) throws {
+        guard isEnabled else { throw WebhookOutbox.QueueError.disabled }
+        guard try WebhookOutbox.binding(for: request) == WebhookOutbox.binding(for: configuredRequest()) else {
+            throw WebhookOutbox.QueueError.changedDestination
         }
+    }
 
-        lastSentAt = Date()
+    private func deliverPrepared(request configured: URLRequest, maximumAttempts: Int? = nil) async throws {
+        guard !deliveryActive else { throw WebhookOutbox.QueueError.busy }
+        deliveryActive = true
+        isSending = true
+        defer { deliveryActive = false; isSending = isFlushing; refreshQueue() }
+        let queue = try requiredOutbox()
+        guard let original = try queue.read(for: configured).prepared else { return }
+        let attempts = max(1, maximumAttempts ?? retryPolicy.maxAttempts)
+        for attempt in 1...attempts {
+            try Task.checkCancellation()
+            try validateCurrentSettings(configured)
+            var state = try queue.read(for: configured)
+            guard var prepared = state.prepared, prepared.sha256 == original.sha256 else {
+                throw WebhookOutbox.QueueError.unavailable
+            }
+            if attempt > 1 { await sleep(retryPolicy.delay(beforeAttempt: attempt)) }
+            try Task.checkCancellation()
+            try validateCurrentSettings(configured)
+            do {
+                // An uncertain POST never earns a blind replay. The receiver
+                // must identify the exact digest under the same account-bound
+                // export and explicitly permit an idempotent continuation.
+                if prepared.attempted && prepared.receiverExportID == nil {
+                    throw WebhookOutbox.QueueError.recoveryUnavailable
+                }
+                if let receipt = try await reconcile(configured, prepared: prepared,
+                                                       allowUnsupported: !prepared.attempted) {
+                    try validateCurrentSettings(configured)
+                    prepared.receiverExportID = receipt.exportID
+                    state = try queue.read(for: configured)
+                    state.prepared = prepared
+                    try queue.save(state)
+                    if receipt.accepted {
+                        complete(try queue.acknowledge(for: configured, digest: prepared.sha256, statusCode: 200))
+                        return
+                    }
+                }
+                try Task.checkCancellation()
+                try validateCurrentSettings(configured)
+                var request = configured
+                request.httpBody = prepared.body
+                request.setValue(prepared.receiverExportID, forHTTPHeaderField: "X-Whereday-Export-ID")
+                prepared.attempted = true
+                state = try queue.read(for: configured)
+                state.prepared = prepared
+                try queue.save(state) // Must be durable before the first byte leaves the app.
+                let (data, response) = try await urlSession.data(for: request)
+                guard let response = response as? HTTPURLResponse else { throw WebhookError.httpError(0) }
+                if (200..<300).contains(response.statusCode) {
+                    if let expected = prepared.receiverExportID {
+                        guard data.count <= 8192,
+                              let receipt = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                              receipt["status"] as? String == "accepted",
+                              receipt["sha256"] as? String == prepared.sha256,
+                              (receipt["capture"] as? [String: Any])?["export_id"] as? String == expected else {
+                            throw WebhookOutbox.QueueError.recoveryUnavailable
+                        }
+                    }
+                    // A settings edit while awaiting the response must not move
+                    // the new account's cursor. Acknowledge only the saved binding.
+                    complete(try queue.acknowledge(for: configured, digest: prepared.sha256,
+                                                   statusCode: response.statusCode))
+                    return
+                }
+                if response.statusCode == 503,
+                   let progress = Self.membershipProgress(data, prepared: prepared) {
+                    prepared.membership = progress
+                    // Preserve points that may have been enqueued while awaiting HTTP.
+                    state = try queue.read(for: configured)
+                    state.prepared = prepared
+                    try queue.save(state)
+                }
+                throw WebhookError.httpError(response.statusCode)
+            } catch {
+                let latest = try queue.read(for: configured).prepared
+                guard attempt < attempts, latest?.receiverExportID != nil,
+                      Self.shouldRetry(error), !Task.isCancelled else { throw error }
+            }
+        }
+    }
+
+    private func reconcile(_ original: URLRequest, prepared: WebhookOutbox.Prepared,
+                           allowUnsupported: Bool) async throws -> (accepted: Bool, exportID: String)? {
+        var request = original
+        request.httpMethod = "GET"
+        request.httpBody = nil
+        request.setValue(nil, forHTTPHeaderField: "Content-Length")
+        request.setValue(prepared.sha256, forHTTPHeaderField: "X-Whereday-Export-SHA256")
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await urlSession.data(for: request)
+        guard let response = response as? HTTPURLResponse else { throw WebhookOutbox.QueueError.recoveryUnavailable }
+        if allowUnsupported && [404, 405, 501].contains(response.statusCode) { return nil }
+        let receipt = data.count <= 8192 ? (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] : nil
+        let status = receipt?["status"] as? String
+        if allowUnsupported, response.statusCode == 200, !["accepted", "capture_pending"].contains(status ?? "") {
+            return nil
+        }
+        guard response.statusCode == 200,
+              receipt?["sha256"] as? String == prepared.sha256,
+              let exportID = (receipt?["capture"] as? [String: Any])?["export_id"] as? String,
+              !exportID.isEmpty, exportID.count <= 512,
+              prepared.receiverExportID == nil || prepared.receiverExportID == exportID else {
+            throw WebhookOutbox.QueueError.recoveryUnavailable
+        }
+        if status == "accepted" { return (true, exportID) }
+        guard status == "capture_pending", receipt?["retry_same_original"] as? Bool == true else {
+            throw WebhookOutbox.QueueError.recoveryUnavailable
+        }
+        return (false, exportID)
+    }
+
+    private static func membershipProgress(_ data: Data, prepared: WebhookOutbox.Prepared) -> WebhookOutbox.Membership? {
+        guard data.count <= 8192,
+              let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              value["status"] as? String == "capture_membership_pending",
+              value["retry_same_original"] as? Bool == true,
+              let exportID = value["export_id"] as? String, exportID == prepared.receiverExportID,
+              let next = value["next_cursor"] as? Int, let total = value["total"] as? Int,
+              next > (prepared.membership?.nextCursor ?? 0), next < total, total <= prepared.body.count,
+              prepared.membership == nil || prepared.membership?.total == total else { return nil }
+        return .init(exportID: exportID, nextCursor: next, total: total)
+    }
+
+    private func complete(_ state: WebhookOutbox.State) {
+        lastSentAt = state.lastSentAt
         defaults.set(lastSentAt, forKey: Self.key(.lastSentAt))
-        lastStatusCode = httpResponse.statusCode
-        defaults.set(httpResponse.statusCode, forKey: Self.key(.lastStatusCode))
+        lastStatusCode = state.lastStatusCode
+        defaults.set(lastStatusCode, forKey: Self.key(.lastStatusCode))
         lastError = nil
         defaults.removeObject(forKey: Self.key(.lastError))
-        let milliseconds = Int(Date().timeIntervalSince(started) * 1000)
-        LogManager.shared.info(
-            "Sent \(points.count) points · \(Self.statusText(httpResponse.statusCode)) · \(milliseconds) ms",
-            category: .webhook
-        )
+        queuedPointCount = state.queuedPointCount
+        LogManager.shared.info("Webhook delivery confirmed · \(Self.statusText(state.lastStatusCode ?? 200))", category: .webhook)
     }
 
     /// "200 OK", "204 No Content", or the bare code for anything less common.
@@ -423,33 +649,6 @@ final class WebhookManager: ObservableObject {
         ]
         guard let reason = reasons[code] else { return "\(code)" }
         return "\(code) \(reason)"
-    }
-
-    private func sendRequestWithRetry(_ request: URLRequest) async throws -> (Data, URLResponse) {
-        let attempts = max(1, retryPolicy.maxAttempts)
-
-        for attempt in 1...attempts {
-            if attempt > 1 {
-                await sleep(retryPolicy.delay(beforeAttempt: attempt))
-            }
-
-            do {
-                let result = try await urlSession.data(for: request)
-                guard let httpResponse = result.1 as? HTTPURLResponse else {
-                    throw WebhookError.httpError(0)
-                }
-                if (200...299).contains(httpResponse.statusCode) {
-                    return result
-                }
-                throw WebhookError.httpError(httpResponse.statusCode)
-            } catch {
-                guard attempt < attempts, Self.shouldRetry(error) else {
-                    throw error
-                }
-            }
-        }
-
-        throw WebhookError.httpError(0)
     }
 
     private static func shouldRetry(_ error: Error) -> Bool {
@@ -641,3 +840,4 @@ enum WebhookError: LocalizedError {
         }
     }
 }
+
