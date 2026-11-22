@@ -213,8 +213,8 @@ final class WebhookOutbox {
 
     func clearWaiting(for request: URLRequest) throws -> State {
         var state = try read(for: request)
-        // An unknown delivery is evidence, not an unsent draft. Preserve it
-        // until the endpoint can reconcile it, even if waiting points are cleared.
+        // An unknown delivery is evidence, not an unsent draft. Keep the queue
+        // intact until it is reconciled; its cursor cannot safely be skipped.
         if let prepared = state.prepared, prepared.attempted {
             return state
         } else {

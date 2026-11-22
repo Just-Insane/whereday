@@ -10,7 +10,9 @@ Before a POST, the sender atomically saves the complete serialized body and its 
 
 Visits-only exports are supported by JSON, CSV, Markdown, GPX, KML and GeoJSON. OwnTracks and Overland require location points and report that limit when given visits alone. An export larger than 16 MiB is held with an explicit error; it is never clipped. Automatic point batches use the configured point count. Manual exports still include all saved data and can exceed that limit.
 
-Changing the endpoint, format or credentials does not send an older queue to the new configuration. Returning to the original settings makes its saved work available again. Disabling delivery retains the queue without sending it.
+Changing the endpoint, format or credentials does not send an older queue to the new configuration. The non-secret `X-Whereday-Export-Format` header identifies the format token explicitly, including formats that share a MIME type, and participates in the local binding. Returning to the original settings makes its saved work available again. Disabling delivery retains the queue without sending it.
+
+Each existing flush task continues through its saved backlog in bounded point batches until empty, cancelled, disabled or stopped by an error. It yields between requests so native observations can add points without losing them. This continuation does not require another location event and adds no scheduler. If iOS ends execution, the next existing app-active/location/timer event resumes the retained remainder.
 
 ## Optional receiver receipt contract
 

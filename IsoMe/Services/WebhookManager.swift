@@ -119,6 +119,8 @@ final class WebhookManager: ObservableObject {
     private var urlSession: URLSession!
     private let retryPolicy: RetryPolicy
     private let sleep: (TimeInterval) async -> Void
+    private var isFlushing = false
+    private var deliveryActive = false
 
     private enum DefaultsKey: String {
         case enabled, url, format, authType
@@ -259,7 +261,7 @@ final class WebhookManager: ObservableObject {
     // MARK: - Sending
 
     private func onNewPoint(locationManager: LocationManager) async {
-        guard isEnabled, !isSending, sendMode != .manual,
+        guard isEnabled, sendMode != .manual,
               let context = modelContainer?.mainContext else { return }
         do {
             let request = try configuredRequest(), queue = try requiredOutbox()
@@ -286,19 +288,31 @@ final class WebhookManager: ObservableObject {
 
     /// Resume an exact prepared request, or prepare a bounded point batch.
     func flushBatch() async {
+        guard !isSending else { return }
+        isFlushing = true
+        isSending = true
+        defer { isFlushing = false; isSending = false; refreshQueue() }
         do {
             guard isEnabled else { throw WebhookOutbox.QueueError.disabled }
-            guard !isSending else { return }
             let request = try configuredRequest(), queue = try requiredOutbox()
-            let state = try queue.read(for: request)
-            if state.prepared != nil { try await deliverPrepared(request: request); return }
-            guard !state.pending.isEmpty else { return }
-            let points = state.pending.prefix(max(1, batchCount)).map { $0.model() }
-            try await sendPoints(points)
+            while true {
+                try Task.checkCancellation()
+                try validateCurrentSettings(request)
+                let state = try queue.read(for: request)
+                if state.prepared != nil {
+                    try await deliverPrepared(request: request)
+                } else {
+                    guard !state.pending.isEmpty else { return }
+                    let points = state.pending.prefix(max(1, batchCount)).map { $0.model() }
+                    try await sendPoints(points)
+                }
+                // Continue this existing flush task until its backlog is empty.
+                // Each request is bounded; cancellation/errors retain the rest.
+                await Task.yield()
+            }
         } catch {
             recordError(error.localizedDescription)
         }
-        refreshQueue()
     }
 
     func enqueuePendingPoint(_ point: LocationPoint) {
@@ -320,16 +334,18 @@ final class WebhookManager: ObservableObject {
 
     /// Send a manual export of all saved data.
     func sendNow() async {
-        guard let context = modelContainer?.mainContext else { return }
+        guard !isSending, let context = modelContainer?.mainContext else { return }
         do {
             let request = try configuredRequest()
             if try requiredOutbox().read(for: request).prepared != nil {
                 try await deliverPrepared(request: request)
+                if sendMode != .manual { await flushBatch() }
                 return
             }
             let visits = try context.fetch(FetchDescriptor<Visit>())
             let points = try context.fetch(FetchDescriptor<LocationPoint>())
             try await sendPoints(points, visits: visits)
+            if sendMode != .manual { await flushBatch() }
         } catch {
             recordError(error.localizedDescription)
         }
@@ -420,7 +436,7 @@ final class WebhookManager: ObservableObject {
     func sendPoints(_ points: [LocationPoint], visits: [Visit] = []) async throws {
         guard !points.isEmpty || !visits.isEmpty else { return }
         guard isEnabled else { throw WebhookOutbox.QueueError.disabled }
-        guard !isSending else { throw WebhookOutbox.QueueError.busy }
+        guard !deliveryActive else { throw WebhookOutbox.QueueError.busy }
         if points.isEmpty && (format == .owntracks || format == .overland) {
             throw WebhookOutbox.QueueError.unsupportedVisits
         }
@@ -442,6 +458,9 @@ final class WebhookManager: ObservableObject {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue(format.mimeType, forHTTPHeaderField: "Content-Type")
+        // JSON, OwnTracks and Overland can share a MIME type. Bind their
+        // distinct format tokens too, without storing a credential or endpoint.
+        request.setValue(format.token, forHTTPHeaderField: "X-Whereday-Export-Format")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("Whereday/\(AppInfo.version)", forHTTPHeaderField: "User-Agent")
         applyAuth(to: &request)
@@ -456,9 +475,10 @@ final class WebhookManager: ObservableObject {
     }
 
     private func deliverPrepared(request configured: URLRequest) async throws {
-        guard !isSending else { throw WebhookOutbox.QueueError.busy }
+        guard !deliveryActive else { throw WebhookOutbox.QueueError.busy }
+        deliveryActive = true
         isSending = true
-        defer { isSending = false; refreshQueue() }
+        defer { deliveryActive = false; isSending = isFlushing; refreshQueue() }
         let queue = try requiredOutbox()
         guard let original = try queue.read(for: configured).prepared else { return }
         let attempts = max(1, retryPolicy.maxAttempts)
