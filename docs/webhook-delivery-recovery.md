@@ -67,3 +67,18 @@ scripts/test-ios.sh \
 The selected suite uses isolated defaults, temporary queue storage and mocked HTTP. It covers visits-only delivery, persistent points/cursor, a lost acknowledgement without another POST, explicit identical-body continuation, changed account or credentials, damaged bytes, disabled delivery, generic unknown results, all-chunk restart recovery and a receipt surviving an interrupted cursor update. Partition cases exercise exact boundaries, visits-only/mixed exports, unknown nested fields, source membership and indivisible oversize errors. Manager cases verify fresh/changed manual rows beside unknown history and a new point arriving during a history POST. Passing these source tests is separate from installing a signed app and observing a genuine phone export.
 
 The app's optional iOS 27.1 arrangement/hinge layouts require their SDK symbols as well as runtime availability. App builds selecting the iPhoneOS or iPhone Simulator 27.0 SDK define `WHEREDAY_NO_DUO_SDK` and use the existing fallback layouts. The newer layouts and their runtime guards remain available with supported newer SDKs; a compiler version alone does not prove those SDK symbols exist. This compatibility condition leaves normal simulator signing and other targets unchanged.
+
+## Connection probes
+
+Test connection sends a small JSON control object with schema
+`whereday.connection_probe` and `schema_version: 1`. It contains no location
+point, visit, export date or source observation, regardless of the selected
+export format. The same configured URL, authentication and native client identity
+are used. It does not enter the export outbox, advance source membership or mark
+LAST SENT as an ordinary export.
+
+An endpoint supporting this probe acknowledges access without storing it as
+location data. EA's matching receiver returns `status: connection_verified` and
+`capture: false` after its normal source checks; other endpoints may reject an
+unsupported probe contract. A probe result does not establish history coverage
+or automatic Live delivery. Genuine source exports retain their existing format.
