@@ -6,13 +6,23 @@ An automatic cursor is armed when delivery is enabled and attached to the native
 
 ## Prepared requests
 
-Before a POST, the sender atomically saves the complete serialized body and its SHA-256 digest. The original `exportDate`, visits and points are retained byte-for-byte. The attempted state is saved before the network call. On acceptance, one atomic state replacement records the delivery cursor and removes the acknowledged work together. A point queued while delivery is in progress is preserved.
+Before a POST, the sender saves each complete serialized body and its SHA-256 digest in protected storage. Independent operation metadata holds that body's attempted state, pinned receiver identity, membership progress and final receipt. Bodies are not combined into one growing state file. A prepared history selection publishes all its originals through one staging-directory rename before any part becomes eligible for transmission. Interrupted staging is never submitted.
 
-Visits-only exports are supported by JSON, CSV, Markdown, GPX, KML and GeoJSON. OwnTracks and Overland require location points and report that limit when given visits alone. An export larger than 16 MiB is held with an explicit error; it is never clipped. Automatic point batches use the configured point count. Manual exports still include all saved data and can exceed that limit.
+The attempted state is durable before the network call. Acceptance is durable before cursor advancement or body cleanup, so an interrupted cursor update cannot turn an accepted original back into a new upload. The existing single-request state can be reopened and migrated without changing its body or receipt. Pending points admitted while a response is outstanding are preserved.
+
+Visits-only exports are supported by JSON, CSV, Markdown, GPX, KML and GeoJSON. OwnTracks and Overland require location points and report that limit when given visits alone. Automatic point batches use the configured point count.
+
+An oversized native JSON history export is partitioned only between complete point and visit objects. Every resulting envelope is at most 16 MiB, retains the original `exportDate` and other top-level values, preserves every field in each selected native record, and recomputes its local point/visit counts. The native point IDs and visit revisions remain associated with the correct originals. These are ordinary JSON export envelopes using the same receipt protocol; no receiver reassembly format is needed. An already bounded export retains its exact original bytes.
+
+An indivisible record or envelope metadata that cannot fit produces an explicit unsent error before any part of that selection is published or transmitted. Other oversized formats also remain unsent. Nothing is clipped, and the saved native source remains available. Indistinguishable bodies with different native membership are held explicitly rather than silently collapsing distinct records.
+
+Manual refresh fetches the current saved source even if older history is unresolved. Durable native point membership and visit revisions prevent unchanged records from being re-exported under a new `exportDate`. New points, new visits and changed exported visit values create independent work. Existing originals remain byte-for-byte unchanged, with their own receipts. Confirmed membership remains local so a restart or another manual refresh does not recreate accepted operations.
 
 Changing the endpoint, format or credentials does not send an older queue to the new configuration. The non-secret `X-Whereday-Export-Format` header identifies the format token explicitly, including formats that share a MIME type, and participates in the local binding. Returning to the original settings makes its saved work available again. Disabling delivery retains the queue without sending it.
 
-Each existing flush task continues through its saved backlog in bounded point batches until empty, cancelled, disabled or stopped by an error. It yields between requests so native observations can add points without losing them. This continuation does not require another location event and adds no scheduler. If iOS ends execution, the next existing app-active/location/timer event resumes the retained remainder.
+Each existing flush task admits fresh points before choosing its next operation, serves fresh work before history, and visits each original at most once in that round. A held or unknown operation retains its exact identity while independent siblings can proceed. Historical recovery gets one attempt per round; each continuation still requires the exact authenticated receipt. The first unresolved failure remains visible even if other work succeeds. One actual sender is active at a time, but native observations and manual source admission can persist fresh work while it awaits HTTP.
+
+The task yields between bounded requests and continues its backlog without another location event or a new scheduler. Cancellation, changed settings or disabled delivery stops the round and retains the remainder. If iOS ends execution, the next existing app-active/location/timer event resumes saved work. Damaged custody metadata is reported as an integrity failure; it is not discarded or treated as permission to recreate a request.
 
 ## Optional receiver receipt contract
 
@@ -46,9 +56,12 @@ HTTP 404, 405 or 501 from the initial GET, or an ordinary HTTP 200 without the r
 Run the canonical simulator test entry point with signing enabled:
 
 ```sh
-scripts/test-ios.sh -only-testing:IsoMeTests/WebhookManagerTests
+scripts/test-ios.sh \
+  -only-testing:IsoMeTests/WebhookManagerTests \
+  -only-testing:IsoMeTests/WebhookContinuationTests \
+  -only-testing:IsoMeTests/WebhookJSONPartitionerTests
 ```
 
-The suite uses isolated defaults, temporary queue storage and mocked HTTP. It covers visits-only delivery, persistent points/cursor, a lost acknowledgement without another POST, explicit identical-body continuation, changed account or credentials, damaged bytes, disabled delivery and generic unknown results. Passing these source tests is separate from installing a signed app and observing a genuine phone export.
+The selected suite uses isolated defaults, temporary queue storage and mocked HTTP. It covers visits-only delivery, persistent points/cursor, a lost acknowledgement without another POST, explicit identical-body continuation, changed account or credentials, damaged bytes, disabled delivery, generic unknown results, all-chunk restart recovery and a receipt surviving an interrupted cursor update. Partition cases exercise exact boundaries, visits-only/mixed exports, unknown nested fields, source membership and indivisible oversize errors. Manager cases verify fresh/changed manual rows beside unknown history and a new point arriving during a history POST. Passing these source tests is separate from installing a signed app and observing a genuine phone export.
 
 The app's optional iOS 27.1 arrangement/hinge layouts require their SDK symbols as well as runtime availability. App builds selecting the iPhoneOS or iPhone Simulator 27.0 SDK define `WHEREDAY_NO_DUO_SDK` and use the existing fallback layouts. The newer layouts and their runtime guards remain available with supported newer SDKs; a compiler version alone does not prove those SDK symbols exist. This compatibility condition leaves normal simulator signing and other targets unchanged.
