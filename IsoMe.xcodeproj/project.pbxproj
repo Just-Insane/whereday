@@ -1536,6 +1536,8 @@
 			"@executable_path/Frameworks",
 		);
 		"MARKETING_VERSION" = "2.0";
+		"OTHER_SWIFT_FLAGS[sdk=iphoneos27.0*]" = "$(inherited) -D WHEREDAY_NO_DUO_SDK";
+		"OTHER_SWIFT_FLAGS[sdk=iphonesimulator27.0*]" = "$(inherited) -D WHEREDAY_NO_DUO_SDK";
 		"PRODUCT_BUNDLE_IDENTIFIER" = "com.bontecou.isome";
 		"PRODUCT_NAME" = "$(TARGET_NAME)";
 		"SWIFT_EMIT_LOC_STRINGS" = YES;
@@ -1569,6 +1571,8 @@
 			"@executable_path/Frameworks",
 		);
 		"MARKETING_VERSION" = "2.0";
+		"OTHER_SWIFT_FLAGS[sdk=iphoneos27.0*]" = "$(inherited) -D WHEREDAY_NO_DUO_SDK";
+		"OTHER_SWIFT_FLAGS[sdk=iphonesimulator27.0*]" = "$(inherited) -D WHEREDAY_NO_DUO_SDK";
 		"PRODUCT_BUNDLE_IDENTIFIER" = "com.bontecou.isome";
 		"PRODUCT_NAME" = "$(TARGET_NAME)";
 		"SWIFT_EMIT_LOC_STRINGS" = YES;

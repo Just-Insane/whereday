@@ -50,3 +50,5 @@ scripts/test-ios.sh -only-testing:IsoMeTests/WebhookManagerTests
 ```
 
 The suite uses isolated defaults, temporary queue storage and mocked HTTP. It covers visits-only delivery, persistent points/cursor, a lost acknowledgement without another POST, explicit identical-body continuation, changed account or credentials, damaged bytes, disabled delivery and generic unknown results. Passing these source tests is separate from installing a signed app and observing a genuine phone export.
+
+The app's optional iOS 27.1 arrangement/hinge layouts require their SDK symbols as well as runtime availability. App builds selecting the iPhoneOS or iPhone Simulator 27.0 SDK define `WHEREDAY_NO_DUO_SDK` and use the existing fallback layouts. The newer layouts and their runtime guards remain available with supported newer SDKs; a compiler version alone does not prove those SDK symbols exist. This compatibility condition leaves normal simulator signing and other targets unchanged.
