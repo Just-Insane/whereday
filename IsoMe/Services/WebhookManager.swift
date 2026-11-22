@@ -497,6 +497,7 @@ final class WebhookManager: ObservableObject {
                 request.httpBody = prepared.body
                 request.setValue(prepared.receiverExportID, forHTTPHeaderField: "X-Whereday-Export-ID")
                 prepared.attempted = true
+                state = try queue.read(for: configured)
                 state.prepared = prepared
                 try queue.save(state) // Must be durable before the first byte leaves the app.
                 let (data, response) = try await urlSession.data(for: request)
