@@ -662,6 +662,68 @@ final class WebhookManagerTests: XCTestCase {
         XCTAssertFalse(manager.isSending)
     }
 
+    func testAcceptedLegacyJSONVisitMembershipSurvivesBodyCleanupAndRestart() async throws {
+        let request = outboxRequest(), queue = try WebhookOutbox(directory: outboxDirectory)
+        let visit = Visit(latitude: 1, longitude: 2, arrivedAt: Date(timeIntervalSince1970: 1_700_000_000), notes: "legacy original")
+        let body = try ExportService.exportToJSON(visits: [visit])
+        var legacy = WebhookOutbox.State(binding: try WebhookOutbox.binding(for: request))
+        legacy.prepared = .init(body: body, sha256: WebhookOutbox.digest(body), points: [], visitCount: 1,
+                                attempted: true, receiverExportID: MockWebhookURLProtocol.exportID)
+        let stateURL = outboxDirectory.appendingPathComponent(legacy.binding + ".json")
+        // A genuine version-one state has no independent operation metadata or
+        // native visit revision IDs. Do not pre-migrate it through queue.save.
+        try JSONEncoder().encode(legacy).write(to: stateURL, options: .atomic)
+        MockWebhookURLProtocol.enqueueReceipt(status: "accepted")
+        let first = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        first.urlString = "https://example.com/hooks/location"
+        await first.flushBatch()
+        XCTAssertNil(first.lastError)
+        XCTAssertNil(try queue.read(for: request).prepared)
+        XCTAssertTrue(MockWebhookURLProtocol.postRequests.isEmpty)
+
+        let reopened = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        reopened.urlString = "https://example.com/hooks/location"
+        try await reopened.sendPoints([], visits: [visit])
+        XCTAssertEqual(MockWebhookURLProtocol.requests.count, 1, "No new GET or POST may recreate the accepted legacy visit")
+        let membership = try WebhookOutbox(directory: outboxDirectory).sourceMembership(for: request)
+        XCTAssertEqual(membership.legacyVisits.count, 1)
+        XCTAssertFalse(membership.unknownVisits)
+    }
+
+    func testOpaqueLegacyVisitHoldsVisitsWhileIdentifiedFreshPointsProceed() async throws {
+        var request = outboxRequest()
+        request.setValue(ExportFormat.csv.mimeType, forHTTPHeaderField: "Content-Type")
+        request.setValue("csv", forHTTPHeaderField: "X-Whereday-Export-Format")
+        let queue = try WebhookOutbox(directory: outboxDirectory)
+        let visit = Visit(latitude: 1, longitude: 2, arrivedAt: Date(timeIntervalSince1970: 1_700_000_000), notes: "legacy original")
+        let original = ExportService.exportToCSV(visits: [visit])
+        let digest = WebhookOutbox.digest(original)
+        var legacy = WebhookOutbox.State(binding: try WebhookOutbox.binding(for: request))
+        legacy.prepared = .init(body: original, sha256: digest, points: [], visitCount: 1, attempted: true)
+        try JSONEncoder().encode(legacy).write(to: outboxDirectory.appendingPathComponent(legacy.binding + ".json"), options: .atomic)
+        MockWebhookURLProtocol.enqueue(statusCode: 200)
+        let manager = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        manager.urlString = "https://example.com/hooks/location"
+        manager.format = .csv
+        let fresh = makePoint(latitude: 9)
+        do {
+            try await manager.sendPoints([fresh], visits: [visit])
+            XCTFail("Opaque legacy visit membership must be explicitly held")
+        } catch WebhookOutbox.QueueError.legacyVisitsUnavailable {}
+        catch { XCTFail("Unexpected error: \(error)") }
+        XCTAssertEqual(MockWebhookURLProtocol.postBodies.count, 1)
+        XCTAssertNotEqual(MockWebhookURLProtocol.postBodies.first, original)
+        XCTAssertNotNil(manager.lastSentAt, "The independently identified point was delivered")
+        try queue.activate(digest, for: request)
+        let retained = try XCTUnwrap(queue.read(for: request).prepared)
+        XCTAssertEqual(retained.body, original)
+        XCTAssertTrue(retained.attempted)
+        XCTAssertEqual(retained.visitCount, 1)
+        let membership = try WebhookOutbox(directory: outboxDirectory).sourceMembership(for: request)
+        XCTAssertTrue(membership.unknownVisits)
+        XCTAssertTrue(membership.points.contains(fresh.id))
+    }
+
     private func outboxRequest() -> URLRequest {
         var request = URLRequest(url: URL(string: "https://example.com/hooks/location")!)
         request.httpMethod = "POST"

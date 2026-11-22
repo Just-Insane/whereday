@@ -448,7 +448,7 @@ final class WebhookManager: ObservableObject {
         let freshPoints = points.filter { !known.points.contains($0.id) }
         let revisions = try visitRevisions(visits)
         let selected = visits.indices.filter {
-            !known.visits.contains(revisions[$0]) && !known.legacyVisits.contains(revisions[$0].sha256)
+            !known.unknownVisits && !known.visits.contains(revisions[$0]) && !known.legacyVisits.contains(revisions[$0].sha256)
         }
         let freshVisits = selected.map { visits[$0] }
         if !freshPoints.isEmpty || !freshVisits.isEmpty {
@@ -460,7 +460,12 @@ final class WebhookManager: ObservableObject {
         // Admission above is synchronous and remains available while one HTTP
         // request is awaiting its response. Its existing drain selects this work
         // before the next historical operation; never start a second sender.
-        try await drainPrepared()
+        do { try await drainPrepared() }
+        catch {
+            if known.unknownVisits && !visits.isEmpty { throw WebhookOutbox.QueueError.legacyVisitsUnavailable }
+            throw error
+        }
+        if known.unknownVisits && !visits.isEmpty { throw WebhookOutbox.QueueError.legacyVisitsUnavailable }
     }
 
     private func visitRevisions(_ visits: [Visit]) throws -> [WebhookOutbox.VisitRevision] {

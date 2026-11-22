@@ -86,6 +86,7 @@ final class WebhookOutbox {
         var visitRevisions: [VisitRevision]?
         var settledAt: Date?
         var statusCode: Int?
+        var legacyVisitHashes: [String]?
 
         init(_ prepared: Prepared) {
             sha256 = prepared.sha256; points = prepared.points; visitCount = prepared.visitCount
@@ -121,7 +122,7 @@ final class WebhookOutbox {
     }
 
     enum QueueError: LocalizedError {
-        case unavailable, changedDestination, recoveryUnavailable, busy, tooLarge, disabled, unsupportedVisits, reservedAuthHeader
+        case unavailable, changedDestination, recoveryUnavailable, busy, tooLarge, disabled, unsupportedVisits, reservedAuthHeader, legacyVisitsUnavailable
         var errorDescription: String? {
             switch self {
             case .unavailable:
@@ -140,6 +141,8 @@ final class WebhookOutbox {
                 return "This format supports location points only. Choose JSON, CSV, Markdown, GPX, KML or GeoJSON to send visits."
             case .reservedAuthHeader:
                 return "Choose a different custom authentication header. X-Whereday-Export-Format, X-Whereday-Export-ID and X-Whereday-Export-SHA256 are reserved for delivery identity."
+            case .legacyVisitsUnavailable:
+                return "An older visit delivery cannot be matched to saved visits. Further visit exports are held for review; new location points can still be sent."
             }
         }
     }
@@ -245,7 +248,7 @@ final class WebhookOutbox {
             try validate(prepared)
             if let url = try operationURL(prepared.sha256, binding: state.binding) {
                 guard try readStored(url).settledAt == nil else { throw QueueError.unavailable }
-                try write(try JSONEncoder().encode(Stored(prepared)), to: url)
+                try write(try JSONEncoder().encode(metadata(prepared)), to: url)
             } else {
                 try storeBatch([prepared], binding: state.binding)
             }
@@ -281,9 +284,10 @@ final class WebhookOutbox {
     /// Source membership survives acceptance and prevents a manual refresh from
     /// recreating a held original with a new exportDate. Visit revisions include
     /// exported values, so a changed note or corrected stay remains fresh work.
-    func sourceMembership(for request: URLRequest) throws -> (points: Set<UUID>, visits: Set<VisitRevision>, legacyVisits: Set<String>) {
+    func sourceMembership(for request: URLRequest) throws -> (points: Set<UUID>, visits: Set<VisitRevision>, legacyVisits: Set<String>, unknownVisits: Bool) {
         let state = try read(for: request)
         var pointIDs = Set<UUID>(), revisions = Set<VisitRevision>(), legacyVisits = Set<String>()
+        var unknownVisits = false
         var originals = try operations(binding: state.binding)
         if let prepared = state.prepared,
            !originals.contains(where: { $0.1.sha256 == prepared.sha256 }) {
@@ -292,21 +296,35 @@ final class WebhookOutbox {
         for (url, stored) in originals {
             pointIDs.formUnion(stored.points.map(\.id))
             if let values = stored.visitRevisions { revisions.formUnion(values) }
-            else if stored.visitCount > 0, stored.settledAt == nil {
+            else if stored.visitCount > 0 {
+                if let hashes = stored.legacyVisitHashes {
+                    legacyVisits.formUnion(hashes)
+                    continue
+                }
                 // A legacy prepared body has no native visit IDs. Preserve its
                 // exact exported revisions rather than silently re-exporting it.
                 let body = state.prepared?.sha256 == stored.sha256 ? state.prepared?.body :
                     (try? Data(contentsOf: url.deletingPathExtension().appendingPathExtension("body")))
-                if let body,
-                   let object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
-                   let visits = object["visits"] as? [[String: Any]] {
-                    for visit in visits {
-                        legacyVisits.insert(Self.digest(try JSONSerialization.data(withJSONObject: visit, options: [.sortedKeys])))
-                    }
-                }
+                if let body, let hashes = try legacyVisitHashes(body, count: stored.visitCount) {
+                    legacyVisits.formUnion(hashes)
+                } else { unknownVisits = true }
             }
         }
-        return (pointIDs, revisions, legacyVisits)
+        return (pointIDs, revisions, legacyVisits, unknownVisits)
+    }
+
+    private func legacyVisitHashes(_ body: Data, count: Int) throws -> [String]? {
+        guard let object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+              let visits = object["visits"] as? [[String: Any]], visits.count == count else { return nil }
+        return try visits.map { Self.digest(try JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys])) }
+    }
+
+    private func metadata(_ prepared: Prepared) throws -> Stored {
+        var stored = Stored(prepared)
+        if prepared.visitRevisions == nil, prepared.visitCount > 0 {
+            stored.legacyVisitHashes = try legacyVisitHashes(prepared.body, count: prepared.visitCount)
+        }
+        return stored
     }
 
     func prepare(body: Data, points: [LocationPoint], visitCount: Int, for request: URLRequest,
@@ -387,6 +405,9 @@ final class WebhookOutbox {
         try storeBatch([prepared], binding: state.binding)
         guard let url = try operationURL(digest, binding: state.binding) else { throw QueueError.unavailable }
         var stored = try readStored(url)
+        if stored.visitRevisions == nil, stored.legacyVisitHashes == nil, stored.visitCount > 0 {
+            stored.legacyVisitHashes = try legacyVisitHashes(prepared.body, count: stored.visitCount)
+        }
         stored.settledAt = Date(); stored.statusCode = statusCode
         // A receipt survives a crash before cursor advancement or body cleanup.
         // The same operation can never become an unattempted draft again.
@@ -435,6 +456,7 @@ final class WebhookOutbox {
               Set(stored.points.map(\.id)).count == stored.points.count,
               stored.visitCount >= 0,
               stored.visitRevisions == nil || stored.visitRevisions?.count == stored.visitCount,
+              stored.legacyVisitHashes == nil || stored.legacyVisitHashes?.count == stored.visitCount,
               stored.statusCode == nil || (200..<300).contains(stored.statusCode!),
               !stored.points.isEmpty || stored.visitCount > 0 else {
             throw QueueError.unavailable
@@ -487,14 +509,12 @@ final class WebhookOutbox {
         for prepared in new {
             try validate(prepared)
             try write(prepared.body, to: staging.appendingPathComponent(prepared.sha256 + ".body"))
-            try write(try JSONEncoder().encode(Stored(prepared)), to: staging.appendingPathComponent(prepared.sha256 + ".json"))
+            try write(try JSONEncoder().encode(metadata(prepared)), to: staging.appendingPathComponent(prepared.sha256 + ".json"))
         }
         // Every chunk of the snapshot has durable exact bytes before it becomes
         // selectable. An interrupted staging directory is never a submitted op.
         try files.moveItem(at: staging, to: root.appendingPathComponent("batch-" + suffix))
     }
 
-    /// Complete native elements remain intact; only the surrounding ordinary
-    /// export envelope and its local counts change. No partial-record protocol.
     private func stateURL(_ binding: String) -> URL { directory.appendingPathComponent(binding + ".json") }
 }
