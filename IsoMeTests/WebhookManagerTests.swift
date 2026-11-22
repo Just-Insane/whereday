@@ -512,6 +512,37 @@ final class WebhookManagerTests: XCTestCase {
         return request
     }
 
+    func testFreshDeliveryProceedsWhileOlderReceiptRemainsUnknown() async throws {
+        let manager = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        manager.urlString = "https://example.com/hooks/location"
+        let old = makePoint()
+        MockWebhookURLProtocol.enqueueReceipt(status: "capture_pending", exportID: "restricted-export:old")
+        MockWebhookURLProtocol.enqueueError(.timedOut)
+        manager.enqueuePendingPoint(old)
+        await manager.flushBatch()
+        let original = try XCTUnwrap(MockWebhookURLProtocol.postBodies.first)
+
+        let fresh = LocationPoint(latitude: 1, longitude: 2,
+                                  timestamp: old.timestamp.addingTimeInterval(3600), horizontalAccuracy: 5)
+        manager.enqueuePendingPoint(fresh)
+        MockWebhookURLProtocol.enqueueReceipt(status: "capture_pending", exportID: "restricted-export:fresh")
+        MockWebhookURLProtocol.enqueueAccepted()
+        MockWebhookURLProtocol.enqueueReceipt(status: "source_unavailable", exportID: "restricted-export:old")
+        await manager.flushBatch()
+        XCTAssertEqual(MockWebhookURLProtocol.postRequests.count, 2)
+        XCTAssertEqual(manager.queuedPointCount, 1)
+        let queue = try WebhookOutbox(directory: outboxDirectory)
+        let held = try XCTUnwrap(queue.read(for: outboxRequest()).prepared)
+        XCTAssertEqual(held.body, original)
+        XCTAssertEqual(held.receiverExportID, "restricted-export:old")
+        XCTAssertTrue(held.attempted)
+
+        MockWebhookURLProtocol.enqueueReceipt(status: "accepted", exportID: "restricted-export:old")
+        await manager.flushBatch()
+        XCTAssertEqual(MockWebhookURLProtocol.postRequests.count, 2)
+        XCTAssertEqual(manager.queuedPointCount, 0)
+    }
+
     private func makeWebhookManager(
         retryPolicy: WebhookManager.RetryPolicy,
         sleep: @escaping (TimeInterval) async -> Void = { _ in }
@@ -679,3 +710,145 @@ private extension NSLock {
     }
 }
 
+
+@MainActor
+final class WebhookContinuationTests: XCTestCase {
+    private func request() -> URLRequest {
+        var value = URLRequest(url: URL(string: "https://example.com/location")!)
+        value.httpMethod = "POST"
+        value.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        value.setValue("Bearer fabricated-fixture", forHTTPHeaderField: "Authorization")
+        return value
+    }
+
+    private func fixture(_ count: Int = 20, visits: Int = 3) throws -> (Data, [LocationPoint]) {
+        let points = (0..<count).map {
+            LocationPoint(latitude: 1, longitude: 2,
+                          timestamp: Date(timeIntervalSince1970: 1_700_000_000 + Double($0)), horizontalAccuracy: 5)
+        }
+        let records = points.enumerated().map { index, point -> [String: Any] in
+            ["timestampUnix": point.timestamp.timeIntervalSince1970, "nativeID": point.id.uuidString,
+             "latitude": point.latitude, "longitude": point.longitude, "sourceIndex": index,
+             "unknown": ["original": String(repeating: "u", count: 40)]]
+        }
+        let body = try JSONSerialization.data(withJSONObject: [
+            "exportDate": "2026-11-22T12:00:00Z", "totalPoints": count, "points": records,
+            "totalVisits": visits,
+            "visits": (0..<visits).map { ["arrivalDate": "2020-01-01T00:00:00Z", "nativeID": "visit-\($0)", "notes": "complete"] },
+            "unknownExportField": ["keep": true]
+        ])
+        return (body, points)
+    }
+
+    func testCompleteNativeElementsSplitWithoutLosingFieldsOrCounts() throws {
+        let (body, _) = try fixture()
+        let chunks = try WebhookOutbox.boundedPayloads(body, pointCount: 20, visitCount: 3, maximumBytes: 900)
+        XCTAssertGreaterThan(chunks.count, 1)
+        var restoredPoints: [[String: Any]] = [], restoredVisits: [[String: Any]] = []
+        for chunk in chunks {
+            XCTAssertLessThanOrEqual(chunk.body.count, 900)
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: chunk.body) as? [String: Any])
+            let points = object["points"] as! [[String: Any]], visits = object["visits"] as! [[String: Any]]
+            XCTAssertEqual(object["totalPoints"] as? Int, points.count)
+            XCTAssertEqual(object["totalVisits"] as? Int, visits.count)
+            XCTAssertEqual(chunk.pointIndices, points.map { $0["sourceIndex"] as! Int })
+            XCTAssertEqual(object["exportDate"] as? String, "2026-11-22T12:00:00Z")
+            XCTAssertEqual((object["unknownExportField"] as? [String: Bool])?["keep"], true)
+            restoredPoints += points; restoredVisits += visits
+        }
+        let original = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        let ordered: ([[String: Any]]) -> NSArray = { $0.sorted { ($0["nativeID"] as! String) < ($1["nativeID"] as! String) } as NSArray }
+        XCTAssertEqual(ordered(restoredPoints), ordered(original["points"] as! [[String: Any]]))
+        XCTAssertEqual(ordered(restoredVisits), ordered(original["visits"] as! [[String: Any]]))
+    }
+
+    func testVisitsOnlyHistorySplitsAndAnIndivisibleRecordIsUnsent() throws {
+        let (body, _) = try fixture(0, visits: 20)
+        let chunks = try WebhookOutbox.boundedPayloads(body, pointCount: 0, visitCount: 20, maximumBytes: 500)
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertEqual(chunks.reduce(0) { $0 + $1.visitCount }, 20)
+        XCTAssertTrue(chunks.allSatisfy { $0.body.count <= 500 && $0.pointIndices.isEmpty })
+        XCTAssertThrowsError(try WebhookOutbox.boundedPayloads(body, pointCount: 0, visitCount: 20, maximumBytes: 32))
+    }
+
+    func testFreshOperationBypassesUnknownHistoryAndReopensItsExactReceipt() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let queue = try WebhookOutbox(directory: root, maximumPayloadBytes: 900)
+        let (body, points) = try fixture(), request = request()
+        _ = try queue.prepare(body: body, points: points, visitCount: 3, for: request, history: true)
+        let oldID = try XCTUnwrap(queue.nextDigest(for: request, excluding: []))
+        try queue.activate(oldID, for: request)
+        var state = try queue.read(for: request)
+        state.prepared?.attempted = true
+        state.prepared?.receiverExportID = "restricted-export:original-account"
+        state.prepared?.membership = .init(exportID: "restricted-export:original-account", nextCursor: 1, total: 5)
+        let original = try XCTUnwrap(state.prepared?.body)
+        try queue.save(state)
+
+        let fresh = LocationPoint(latitude: 1, longitude: 2, timestamp: Date(timeIntervalSince1970: 1_800_000_000), horizontalAccuracy: 5)
+        let freshBody = try JSONSerialization.data(withJSONObject: ["exportDate": "2026-11-22T12:01:00Z", "totalPoints": 1,
+             "points": [["latitude": 1, "longitude": 2, "timestampUnix": fresh.timestamp.timeIntervalSince1970]]])
+        _ = try queue.prepare(body: freshBody, points: [fresh], visitCount: 0, for: request)
+        let freshID = try XCTUnwrap(queue.nextDigest(for: request, excluding: []))
+        XCTAssertEqual(freshID, WebhookOutbox.digest(freshBody))
+        XCTAssertNotEqual(freshID, oldID)
+        try queue.activate(freshID, for: request)
+        _ = try queue.acknowledge(for: request, digest: freshID, statusCode: 200)
+
+        let reopened = try WebhookOutbox(directory: root, maximumPayloadBytes: 900)
+        try reopened.activate(oldID, for: request)
+        let recovered = try XCTUnwrap(reopened.read(for: request).prepared)
+        XCTAssertEqual(recovered.body, original)
+        XCTAssertEqual(recovered.sha256, oldID)
+        XCTAssertEqual(recovered.receiverExportID, "restricted-export:original-account")
+        XCTAssertTrue(recovered.attempted)
+        XCTAssertEqual(recovered.membership?.nextCursor, 1)
+        XCTAssertTrue(try reopened.hasHistory(for: request))
+        var changed = request
+        changed.setValue("Bearer other-fabricated-account", forHTTPHeaderField: "Authorization")
+        XCTAssertNil(try reopened.nextDigest(for: changed, excluding: []))
+    }
+
+    func testEveryPreparedChunkSurvivesRestartWithoutReformatting() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (body, points) = try fixture(), request = request()
+        let queue = try WebhookOutbox(directory: root, maximumPayloadBytes: 900)
+        _ = try queue.prepare(body: body, points: points, visitCount: 3, for: request, history: true)
+        var seen = Set<String>(), pointIDs = Set<UUID>(), visits = 0
+        while let id = try queue.nextDigest(for: request, excluding: seen) {
+            seen.insert(id)
+            let reopened = try WebhookOutbox(directory: root, maximumPayloadBytes: 900)
+            try reopened.activate(id, for: request)
+            let operation = try XCTUnwrap(reopened.read(for: request).prepared)
+            XCTAssertEqual(operation.sha256, WebhookOutbox.digest(operation.body))
+            XCTAssertLessThanOrEqual(operation.body.count, 900)
+            pointIDs.formUnion(operation.points.map(\.id)); visits += operation.visitCount
+            _ = try reopened.acknowledge(for: request, digest: id, statusCode: 200)
+        }
+        XCTAssertGreaterThan(seen.count, 1)
+        XCTAssertEqual(pointIDs, Set(points.map(\.id)))
+        XCTAssertEqual(visits, 3)
+        XCTAssertFalse(try queue.hasHistory(for: request))
+        XCTAssertEqual(try queue.read(for: request).queuedPointCount, 0)
+    }
+
+    func testReceiptSurvivesInterruptedCursorCommitWithoutResubmission() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (body, points) = try fixture(1, visits: 0), request = request()
+        let queue = try WebhookOutbox(directory: root)
+        _ = try queue.prepare(body: body, points: points, visitCount: 0, for: request)
+        let stateURL = root.appendingPathComponent(try WebhookOutbox.binding(for: request) + ".json")
+        let beforeCursorCommit = try Data(contentsOf: stateURL)
+        _ = try queue.acknowledge(for: request, digest: WebhookOutbox.digest(body), statusCode: 200)
+        try beforeCursorCommit.write(to: stateURL, options: .atomic)
+        let reopened = try WebhookOutbox(directory: root)
+        XCTAssertNil(try reopened.nextDigest(for: request, excluding: []))
+        let repaired = try reopened.read(for: request)
+        XCTAssertNil(repaired.prepared)
+        XCTAssertEqual(repaired.cursor?.pointIDs, Set(points.map(\.id)))
+        XCTAssertEqual(repaired.lastStatusCode, 200)
+    }
+}

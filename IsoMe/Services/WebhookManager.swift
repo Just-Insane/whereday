@@ -119,6 +119,7 @@ final class WebhookManager: ObservableObject {
     private var urlSession: URLSession!
     private let retryPolicy: RetryPolicy
     private let sleep: (TimeInterval) async -> Void
+    private var isDraining = false
 
     private enum DefaultsKey: String {
         case enabled, url, format, authType
@@ -259,7 +260,7 @@ final class WebhookManager: ObservableObject {
     // MARK: - Sending
 
     private func onNewPoint(locationManager: LocationManager) async {
-        guard isEnabled, !isSending, sendMode != .manual,
+        guard isEnabled, sendMode != .manual,
               let context = modelContainer?.mainContext else { return }
         do {
             let request = try configuredRequest(), queue = try requiredOutbox()
@@ -284,21 +285,46 @@ final class WebhookManager: ObservableObject {
         }
     }
 
-    /// Resume an exact prepared request, or prepare a bounded point batch.
+    /// Each round gives fresh source records first service and visits each
+    /// independent original once. Unknown history retains its exact identity.
     func flushBatch() async {
-        do {
-            guard isEnabled else { throw WebhookOutbox.QueueError.disabled }
-            guard !isSending else { return }
-            let request = try configuredRequest(), queue = try requiredOutbox()
-            let state = try queue.read(for: request)
-            if state.prepared != nil { try await deliverPrepared(request: request); return }
-            guard !state.pending.isEmpty else { return }
-            let points = state.pending.prefix(max(1, batchCount)).map { $0.model() }
-            try await sendPoints(points)
-        } catch {
-            recordError(error.localizedDescription)
-        }
+        do { try await drainPrepared() }
+        catch { recordError(error.localizedDescription) }
         refreshQueue()
+    }
+
+    private func drainPrepared() async throws {
+        guard isEnabled else { throw WebhookOutbox.QueueError.disabled }
+        guard !isSending, !isDraining else { return }
+        isDraining = true
+        defer { isDraining = false }
+        let request = try configuredRequest(), queue = try requiredOutbox()
+        var visited = Set<String>()
+        var firstFailure: Error?
+        while true {
+            try validateCurrentSettings(request)
+            try Task.checkCancellation()
+            let points = Array(try queue.unpreparedPoints(for: request).prefix(max(1, batchCount)))
+            if !points.isEmpty {
+                let body = try formatPayload(points: points)
+                _ = try queue.prepare(body: body, points: points, visitCount: 0, for: request)
+            }
+            guard let digest = try queue.nextDigest(for: request, excluding: visited) else { break }
+            visited.insert(digest)
+            do {
+                try queue.activate(digest, for: request)
+                // A historical failure gets one opportunity in this round.
+                // Every continuation still goes through the exact receipt.
+                let history = try queue.read(for: request).prepared?.history == true
+                try await deliverPrepared(request: request, maximumAttempts: history ? 1 : nil)
+            } catch {
+                if firstFailure == nil { firstFailure = error }
+            }
+        }
+        if try queue.damagedOperationCount(for: request) > 0, firstFailure == nil {
+            firstFailure = WebhookOutbox.QueueError.unavailable
+        }
+        if let firstFailure { throw firstFailure }
     }
 
     func enqueuePendingPoint(_ point: LocationPoint) {
@@ -323,13 +349,13 @@ final class WebhookManager: ObservableObject {
         guard let context = modelContainer?.mainContext else { return }
         do {
             let request = try configuredRequest()
-            if try requiredOutbox().read(for: request).prepared != nil {
-                try await deliverPrepared(request: request)
+            if try requiredOutbox().hasHistory(for: request) {
+                try await drainPrepared()
                 return
             }
             let visits = try context.fetch(FetchDescriptor<Visit>())
             let points = try context.fetch(FetchDescriptor<LocationPoint>())
-            try await sendPoints(points, visits: visits)
+            try await sendPoints(points, visits: visits, history: true)
         } catch {
             recordError(error.localizedDescription)
         }
@@ -337,15 +363,10 @@ final class WebhookManager: ObservableObject {
 
     private func resumeAutomaticWork() async {
         guard isEnabled, !isSending else { return }
-        do {
-            let request = try configuredRequest()
-            if try requiredOutbox().read(for: request).prepared != nil {
-                try await deliverPrepared(request: request)
-            }
-            if let locationManager = attachedLocationManager, sendMode != .manual {
-                await onNewPoint(locationManager: locationManager)
-            }
-        } catch { recordError(error.localizedDescription) }
+        if let locationManager = attachedLocationManager, sendMode != .manual {
+            await onNewPoint(locationManager: locationManager)
+        }
+        await flushBatch()
     }
 
     private func armCursorIfNeeded() {
@@ -417,7 +438,7 @@ final class WebhookManager: ObservableObject {
 
     // MARK: - Core send
 
-    func sendPoints(_ points: [LocationPoint], visits: [Visit] = []) async throws {
+    func sendPoints(_ points: [LocationPoint], visits: [Visit] = [], history: Bool = false) async throws {
         guard !points.isEmpty || !visits.isEmpty else { return }
         guard isEnabled else { throw WebhookOutbox.QueueError.disabled }
         guard !isSending else { throw WebhookOutbox.QueueError.busy }
@@ -425,16 +446,11 @@ final class WebhookManager: ObservableObject {
             throw WebhookOutbox.QueueError.unsupportedVisits
         }
         let request = try configuredRequest()
-        // A previous manual export may have an unknown result. Reconcile that
-        // original before making a new export with a different exportDate.
-        if try requiredOutbox().read(for: request).prepared != nil {
-            try await deliverPrepared(request: request)
-            return
-        }
         let body = try formatPayload(points: points, visits: visits)
-        _ = try requiredOutbox().prepare(body: body, points: points, visitCount: visits.count, for: request)
+        _ = try requiredOutbox().prepare(body: body, points: points, visitCount: visits.count,
+                                        for: request, history: history)
         refreshQueue()
-        try await deliverPrepared(request: request)
+        try await drainPrepared()
     }
 
     private func configuredRequest() throws -> URLRequest {
@@ -455,13 +471,13 @@ final class WebhookManager: ObservableObject {
         }
     }
 
-    private func deliverPrepared(request configured: URLRequest) async throws {
+    private func deliverPrepared(request configured: URLRequest, maximumAttempts: Int? = nil) async throws {
         guard !isSending else { throw WebhookOutbox.QueueError.busy }
         isSending = true
         defer { isSending = false; refreshQueue() }
         let queue = try requiredOutbox()
         guard let original = try queue.read(for: configured).prepared else { return }
-        let attempts = max(1, retryPolicy.maxAttempts)
+        let attempts = max(1, maximumAttempts ?? retryPolicy.maxAttempts)
         for attempt in 1...attempts {
             try Task.checkCancellation()
             try validateCurrentSettings(configured)
@@ -789,4 +805,3 @@ enum WebhookError: LocalizedError {
         }
     }
 }
-
