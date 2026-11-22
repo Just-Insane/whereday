@@ -130,6 +130,7 @@
 		AB000001212F0AA1000000A1 /* IsoMeReadIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000001212F0AA0000000A1 /* IsoMeReadIntents.swift */; };
 		AB000001212F0BB100000B1 /* IsoMeRenameIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000001212F0BB000000B1 /* IsoMeRenameIntents.swift */; };
 		C5F68C85D33E49FB8E0846D5 /* WebhookManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4E900BDC375415EB884300D /* WebhookManager.swift */; };
+		EA2026112200000000000001 /* WebhookOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA2026112200000000000002 /* WebhookOutbox.swift */; };
 		B4BEE4EDDABA4EBEA161EC3D /* WebhookSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24650F0FA6274DB58B9869F5 /* WebhookSettingsView.swift */; };
 		F3601C83F23A13A26444AD47 /* SharedLocationDataTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1FE2A7AF0F63FFD8AE276F3 /* SharedLocationDataTests.swift */; };
 		E6120001212F000100000012 /* ExportServiceRoundTripTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6120001212F000000000012 /* ExportServiceRoundTripTests.swift */; };
@@ -348,6 +349,7 @@
 		AB000001212F0BB000000B1 /* IsoMeRenameIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IsoMeRenameIntents.swift; sourceTree = "<group>"; };
 		9DE47A9C94C8FC4C2E32835B /* SessionPathMapView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SessionPathMapView.swift; sourceTree = "<group>"; };
 		E4E900BDC375415EB884300D /* WebhookManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebhookManager.swift; sourceTree = "<group>"; };
+		EA2026112200000000000002 /* WebhookOutbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebhookOutbox.swift; sourceTree = "<group>"; };
 		24650F0FA6274DB58B9869F5 /* WebhookSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebhookSettingsView.swift; sourceTree = "<group>"; };
 		D15C04D0BA000000000000B2 /* DiscordPromoBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiscordPromoBanner.swift; sourceTree = "<group>"; };
 		A1000000212F000000000000 /* IsoMe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = IsoMe.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -669,6 +671,7 @@
 				D6000002212F000000000002 /* DailyExportNotificationScheduler.swift */,
 				D6000001212F000000000001 /* PushRegistrationManager.swift */,
 				E4E900BDC375415EB884300D /* WebhookManager.swift */,
+				EA2026112200000000000002 /* WebhookOutbox.swift */,
 				C0DE0206212F000000000206 /* WatchLocationSyncReceiver.swift */,
 				75CA00000000000000000101 /* WatchVisitCommandProcessor.swift */,
 			);
@@ -1223,6 +1226,7 @@
 				D6000002212F000100000002 /* DailyExportNotificationScheduler.swift in Sources */,
 				D6000001212F000100000001 /* PushRegistrationManager.swift in Sources */,
 				C5F68C85D33E49FB8E0846D5 /* WebhookManager.swift in Sources */,
+				EA2026112200000000000001 /* WebhookOutbox.swift in Sources */,
 				B4BEE4EDDABA4EBEA161EC3D /* WebhookSettingsView.swift in Sources */,
 				9038E89D0D7D984DC89F365B /* DebugSelfie.swift in Sources */,
 			);

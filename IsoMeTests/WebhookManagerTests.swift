@@ -1,3 +1,4 @@
+import CryptoKit
 import Security
 import XCTest
 @testable import IsoMe
@@ -13,11 +14,14 @@ final class WebhookManagerTests: XCTestCase {
     private let testLegacyKey = "webhook.tests.authValue"
     private var defaults: UserDefaults!
     private var defaultsSuiteName: String!
+    private var outboxDirectory: URL!
 
     override func setUpWithError() throws {
         try super.setUpWithError()
         defaultsSuiteName = "WebhookManagerTests.\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: defaultsSuiteName)!
+        defaults.set(true, forKey: "webhook.enabled")
+        outboxDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(defaultsSuiteName)
         WebhookManager.keychainWriteString("", account: testAccount)
         UserDefaults.standard.removeObject(forKey: testLegacyKey)
         MockWebhookURLProtocol.reset()
@@ -48,6 +52,8 @@ final class WebhookManagerTests: XCTestCase {
         defaults.removePersistentDomain(forName: defaultsSuiteName)
         defaults = nil
         defaultsSuiteName = nil
+        try? FileManager.default.removeItem(at: outboxDirectory)
+        outboxDirectory = nil
         WebhookManager.keychainWriteString("", account: testAccount)
         UserDefaults.standard.removeObject(forKey: testLegacyKey)
         super.tearDown()
@@ -227,11 +233,11 @@ final class WebhookManagerTests: XCTestCase {
         XCTAssertEqual(manager.queuedPointCount, 0)
         XCTAssertNil(manager.lastError)
         XCTAssertNotNil(manager.lastSentAt)
-        XCTAssertEqual(MockWebhookURLProtocol.requests.count, 1)
-        XCTAssertEqual(MockWebhookURLProtocol.requests.first?.httpMethod, "POST")
-        XCTAssertEqual(MockWebhookURLProtocol.requests.first?.value(forHTTPHeaderField: "Content-Type"), "application/json")
+        XCTAssertEqual(MockWebhookURLProtocol.postRequests.count, 1)
+        XCTAssertEqual(MockWebhookURLProtocol.postRequests.first?.httpMethod, "POST")
+        XCTAssertEqual(MockWebhookURLProtocol.postRequests.first?.value(forHTTPHeaderField: "Content-Type"), "application/json")
 
-        let body = String(data: MockWebhookURLProtocol.requestBodies.first ?? Data(), encoding: .utf8)
+        let body = String(data: MockWebhookURLProtocol.postBodies.first ?? Data(), encoding: .utf8)
         XCTAssertTrue(body?.contains("10.1") == true)
         XCTAssertTrue(body?.contains("-20.2") == true)
     }
@@ -275,13 +281,14 @@ final class WebhookManagerTests: XCTestCase {
         XCTAssertEqual(manager.lastError, "Server returned HTTP 500")
         XCTAssertNil(manager.lastSentAt)
         XCTAssertEqual(defaults.string(forKey: "webhook.lastError"), "Server returned HTTP 500")
-        XCTAssertEqual(MockWebhookURLProtocol.requests.count, 1)
+        XCTAssertEqual(MockWebhookURLProtocol.postRequests.count, 1)
     }
 
     func testFlushBatchRetriesWithBackoffBeforeSuccess() async {
+        for _ in 0..<3 { MockWebhookURLProtocol.enqueueReceipt(status: "capture_pending") }
         MockWebhookURLProtocol.enqueue(statusCode: 500)
         MockWebhookURLProtocol.enqueue(statusCode: 502)
-        MockWebhookURLProtocol.enqueue(statusCode: 204)
+        MockWebhookURLProtocol.enqueueAccepted()
         var requestedDelays: [TimeInterval] = []
         let manager = makeWebhookManager(
             retryPolicy: .init(maxAttempts: 3, baseDelay: 0.25, multiplier: 3),
@@ -292,7 +299,8 @@ final class WebhookManagerTests: XCTestCase {
 
         await manager.flushBatch()
 
-        XCTAssertEqual(MockWebhookURLProtocol.requests.count, 3)
+        XCTAssertEqual(MockWebhookURLProtocol.postRequests.count, 3)
+        XCTAssertEqual(Set(MockWebhookURLProtocol.postBodies).count, 1)
         XCTAssertEqual(requestedDelays, [0.25, 0.75])
         XCTAssertEqual(manager.queuedPointCount, 0)
         XCTAssertNil(manager.lastError)
@@ -312,6 +320,198 @@ final class WebhookManagerTests: XCTestCase {
         }
     }
 
+    func testVisitsOnlyJSONExportIsDelivered() async throws {
+        MockWebhookURLProtocol.enqueue(statusCode: 200)
+        let manager = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        manager.urlString = "https://example.com/hooks/location"
+        let visit = Visit(latitude: 0, longitude: 0,
+                          arrivedAt: Date(timeIntervalSince1970: 1_776_000_000))
+
+        try await manager.sendPoints([], visits: [visit])
+
+        XCTAssertEqual(MockWebhookURLProtocol.postBodies.count, 1)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: MockWebhookURLProtocol.postBodies[0]) as? [String: Any])
+        XCTAssertEqual(payload["totalVisits"] as? Int, 1)
+        XCTAssertEqual((payload["visits"] as? [Any])?.count, 1)
+        XCTAssertEqual(payload["totalPoints"] as? Int, 0)
+        XCTAssertNotNil(manager.lastSentAt)
+    }
+
+    func testPointOnlyFormatReportsUnsupportedVisitsWithoutClaimingSuccess() async {
+        let manager = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        manager.urlString = "https://example.com/hooks/location"
+        manager.format = .owntracks
+        do {
+            try await manager.sendPoints([], visits: [Visit(latitude: 0, longitude: 0, arrivedAt: Date())])
+            XCTFail("Visits must not silently become an empty point export")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("supports location points only"))
+        }
+        XCTAssertTrue(MockWebhookURLProtocol.requests.isEmpty)
+        XCTAssertNil(manager.lastSentAt)
+    }
+
+    func testPendingPointsAndAcknowledgedCursorSurviveReopening() throws {
+        let request = outboxRequest()
+        let first = makePoint(), second = makePoint()
+        let queue = try WebhookOutbox(directory: outboxDirectory)
+        _ = try queue.enqueue([first, second, first], for: request)
+        _ = try queue.prepare(body: Data("exact original".utf8), points: [first, second], visitCount: 0, for: request)
+        let reopened = try WebhookOutbox(directory: outboxDirectory)
+        let pending = try reopened.read(for: request)
+        XCTAssertEqual(pending.pending.count, 2)
+        XCTAssertEqual(pending.prepared?.body, Data("exact original".utf8))
+        XCTAssertNil(pending.cursor)
+
+        _ = try reopened.acknowledge(for: request, digest: XCTUnwrap(pending.prepared?.sha256), statusCode: 200)
+
+        let settled = try WebhookOutbox(directory: outboxDirectory).read(for: request)
+        XCTAssertTrue(settled.pending.isEmpty)
+        XCTAssertNil(settled.prepared)
+        XCTAssertEqual(settled.cursor?.timestamp, first.timestamp)
+        XCTAssertEqual(settled.cursor?.pointIDs, Set([first.id, second.id]))
+        XCTAssertTrue(settled.cursor?.includes(first) == true)
+        XCTAssertFalse(settled.cursor?.includes(makePoint()) == true,
+                       "A distinct point with the same timestamp must remain eligible")
+    }
+
+    func testRestartAfterLostAcknowledgementUsesReceiptWithoutAnotherPost() async throws {
+        MockWebhookURLProtocol.enqueueReceipt(status: "capture_pending")
+        MockWebhookURLProtocol.enqueueError(.timedOut)
+        var manager: WebhookManager? = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        manager!.urlString = "https://example.com/hooks/location"
+        manager!.enqueuePendingPoint(makePoint())
+        await manager!.flushBatch()
+        let original = try XCTUnwrap(MockWebhookURLProtocol.postBodies.first)
+        XCTAssertEqual(manager!.queuedPointCount, 1)
+        XCTAssertNil(manager!.lastSentAt)
+        manager = nil
+
+        MockWebhookURLProtocol.enqueueReceipt(status: "accepted")
+        let reopened = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        await reopened.flushBatch()
+
+        XCTAssertEqual(MockWebhookURLProtocol.postBodies, [original])
+        XCTAssertEqual(reopened.queuedPointCount, 0)
+        XCTAssertNotNil(reopened.lastSentAt)
+        XCTAssertNil(try WebhookOutbox(directory: outboxDirectory).read(for: outboxRequest()).prepared)
+    }
+
+    func testRestartWithExplicitPendingReceiptSendsTheIdenticalOriginal() async throws {
+        MockWebhookURLProtocol.enqueueReceipt(status: "capture_pending")
+        MockWebhookURLProtocol.enqueueError(.networkConnectionLost)
+        let first = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        first.urlString = "https://example.com/hooks/location"
+        first.enqueuePendingPoint(makePoint())
+        await first.flushBatch()
+        let body = try XCTUnwrap(MockWebhookURLProtocol.postBodies.first)
+
+        MockWebhookURLProtocol.enqueueReceipt(status: "capture_pending")
+        MockWebhookURLProtocol.enqueueAccepted()
+        let reopened = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        await reopened.flushBatch()
+
+        XCTAssertEqual(MockWebhookURLProtocol.postBodies, [body, body])
+        XCTAssertEqual(reopened.queuedPointCount, 0)
+        XCTAssertEqual(Set(MockWebhookURLProtocol.postRequests.compactMap {
+            $0.value(forHTTPHeaderField: "X-Whereday-Export-ID")
+        }), [MockWebhookURLProtocol.exportID])
+    }
+
+    func testGenericUnknownDeliveryRemainsQueuedAcrossRestartAndClear() async throws {
+        MockWebhookURLProtocol.enqueueError(.timedOut)
+        let first = makeWebhookManager(retryPolicy: .init(maxAttempts: 3, baseDelay: 0, multiplier: 1))
+        first.urlString = "https://example.com/hooks/location"
+        first.enqueuePendingPoint(makePoint())
+        await first.flushBatch()
+        XCTAssertEqual(MockWebhookURLProtocol.postRequests.count, 1)
+        let requestCount = MockWebhookURLProtocol.requests.count
+
+        let reopened = makeWebhookManager(retryPolicy: .init(maxAttempts: 3, baseDelay: 0, multiplier: 1))
+        await reopened.flushBatch()
+        reopened.clearQueue()
+
+        XCTAssertEqual(MockWebhookURLProtocol.requests.count, requestCount)
+        XCTAssertEqual(reopened.queuedPointCount, 1)
+        XCTAssertNil(reopened.lastSentAt)
+        XCTAssertTrue(reopened.lastError?.contains("no uncertain upload was repeated") == true)
+        XCTAssertTrue(try WebhookOutbox(directory: outboxDirectory).read(for: outboxRequest()).prepared?.attempted == true)
+    }
+
+    func testChangedReceiverAccountCannotAcknowledgeOrReplayUnknownDelivery() async {
+        MockWebhookURLProtocol.enqueueReceipt(status: "capture_pending")
+        MockWebhookURLProtocol.enqueueError(.timedOut)
+        let first = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        first.urlString = "https://example.com/hooks/location"
+        first.enqueuePendingPoint(makePoint())
+        await first.flushBatch()
+
+        MockWebhookURLProtocol.enqueueReceipt(status: "accepted", exportID: "restricted-export:different-account")
+        let reopened = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        await reopened.flushBatch()
+
+        XCTAssertEqual(MockWebhookURLProtocol.postRequests.count, 1)
+        XCTAssertEqual(reopened.queuedPointCount, 1)
+        XCTAssertNil(reopened.lastSentAt)
+    }
+
+    func testChangedCredentialsAndDestinationCannotReadAnOldQueue() throws {
+        let queue = try WebhookOutbox(directory: outboxDirectory)
+        var original = outboxRequest()
+        original.setValue("test-secret-one", forHTTPHeaderField: "X-Custom-Auth")
+        _ = try queue.enqueue([makePoint()], for: original)
+        var changed = original
+        changed.setValue("test-secret-two", forHTTPHeaderField: "X-Custom-Auth")
+        XCTAssertTrue(try queue.read(for: changed).pending.isEmpty)
+        changed = original
+        changed.url = URL(string: "https://example.org/another-destination")!
+        XCTAssertTrue(try queue.read(for: changed).pending.isEmpty)
+        XCTAssertEqual(try queue.read(for: original).pending.count, 1)
+        let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: outboxDirectory, includingPropertiesForKeys: nil).first)
+        let encoded = try String(contentsOf: file, encoding: .utf8)
+        XCTAssertFalse(encoded.contains("test-secret-one"))
+        XCTAssertFalse(encoded.contains("example.com"))
+    }
+
+    func testDamagedPreparedBytesAreHeldWithoutNetworkOrCursorAdvance() async throws {
+        let queue = try WebhookOutbox(directory: outboxDirectory), request = outboxRequest()
+        _ = try queue.enqueue([makePoint()], for: request)
+        _ = try queue.prepare(body: Data("original".utf8), points: [makePoint()], visitCount: 0, for: request)
+        let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: outboxDirectory, includingPropertiesForKeys: nil).first)
+        var value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+        var prepared = try XCTUnwrap(value["prepared"] as? [String: Any])
+        prepared["body"] = Data("damaged".utf8).base64EncodedString()
+        value["prepared"] = prepared
+        try JSONSerialization.data(withJSONObject: value).write(to: file, options: .atomic)
+
+        let manager = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        manager.urlString = "https://example.com/hooks/location"
+        await manager.flushBatch()
+
+        XCTAssertTrue(MockWebhookURLProtocol.requests.isEmpty)
+        XCTAssertNil(manager.lastSentAt)
+        XCTAssertThrowsError(try queue.read(for: request))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testDisabledSenderKeepsPendingWorkWithoutNetwork() async {
+        let manager = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        manager.urlString = "https://example.com/hooks/location"
+        manager.enqueuePendingPoint(makePoint())
+        manager.isEnabled = false
+        await manager.flushBatch()
+        XCTAssertEqual(manager.queuedPointCount, 1)
+        XCTAssertTrue(MockWebhookURLProtocol.requests.isEmpty)
+    }
+
+    private func outboxRequest() -> URLRequest {
+        var request = URLRequest(url: URL(string: "https://example.com/hooks/location")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        return request
+    }
+
     private func makeWebhookManager(
         retryPolicy: WebhookManager.RetryPolicy,
         sleep: @escaping (TimeInterval) async -> Void = { _ in }
@@ -322,6 +522,7 @@ final class WebhookManagerTests: XCTestCase {
         return WebhookManager(
             defaults: defaults,
             urlSession: session,
+            outboxDirectory: outboxDirectory,
             retryPolicy: retryPolicy,
             sleep: sleep
         )
@@ -341,19 +542,46 @@ private final class MockWebhookURLProtocol: URLProtocol {
     private struct Response {
         let statusCode: Int
         let body: Data
+        var error: URLError?
+        var acceptance = false
     }
 
+    private struct Receipt {
+        let status: String
+        let exportID: String
+    }
+
+    static let exportID = "restricted-export:test-account-fixed-identity"
     private static let lock = NSLock()
     private static var queuedResponses: [Response] = []
+    private static var queuedReceipts: [Receipt] = []
     private(set) static var requests: [URLRequest] = []
     private(set) static var requestBodies: [Data] = []
 
     static func reset() {
         lock.withLock {
             queuedResponses = []
+            queuedReceipts = []
             requests = []
             requestBodies = []
         }
+    }
+
+    static var postRequests: [URLRequest] { lock.withLock { requests.filter { $0.httpMethod == "POST" } } }
+    static var postBodies: [Data] {
+        lock.withLock { zip(requests, requestBodies).filter { $0.0.httpMethod == "POST" }.map { $0.1 } }
+    }
+
+    static func enqueueReceipt(status: String, exportID: String = MockWebhookURLProtocol.exportID) {
+        lock.withLock { queuedReceipts.append(Receipt(status: status, exportID: exportID)) }
+    }
+
+    static func enqueueAccepted() {
+        lock.withLock { queuedResponses.append(Response(statusCode: 200, body: Data(), acceptance: true)) }
+    }
+
+    static func enqueueError(_ code: URLError.Code) {
+        lock.withLock { queuedResponses.append(Response(statusCode: 0, body: Data(), error: URLError(code))) }
     }
 
     static func enqueue(statusCode: Int, body: Data = Data()) {
@@ -371,14 +599,30 @@ private final class MockWebhookURLProtocol: URLProtocol {
     }
 
     override func startLoading() {
+        let body = Self.bodyData(from: request)
         let next: Response? = Self.lock.withLock {
             Self.requests.append(request)
-            Self.requestBodies.append(Self.bodyData(from: request))
+            Self.requestBodies.append(body)
+            if request.httpMethod == "GET" {
+                guard !Self.queuedReceipts.isEmpty else { return Response(statusCode: 405, body: Data()) }
+                let receipt = Self.queuedReceipts.removeFirst()
+                let json: [String: Any] = [
+                    "status": receipt.status,
+                    "sha256": request.value(forHTTPHeaderField: "X-Whereday-Export-SHA256") ?? "",
+                    "capture": ["export_id": receipt.exportID], "retry_same_original": true,
+                ]
+                return Response(statusCode: 200, body: try! JSONSerialization.data(withJSONObject: json))
+            }
             return Self.queuedResponses.isEmpty ? nil : Self.queuedResponses.removeFirst()
         }
 
         guard let next else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+
+        if let error = next.error {
+            client?.urlProtocol(self, didFailWithError: error)
             return
         }
 
@@ -389,7 +633,15 @@ private final class MockWebhookURLProtocol: URLProtocol {
             headerFields: nil
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: next.body)
+        let reply: Data
+        if next.acceptance {
+            let json: [String: Any] = [
+                "status": "accepted", "sha256": SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined(),
+                "capture": ["export_id": request.value(forHTTPHeaderField: "X-Whereday-Export-ID") ?? ""],
+            ]
+            reply = try! JSONSerialization.data(withJSONObject: json)
+        } else { reply = next.body }
+        client?.urlProtocol(self, didLoad: reply)
         client?.urlProtocolDidFinishLoading(self)
     }
 
@@ -426,3 +678,4 @@ private extension NSLock {
         return body()
     }
 }
+
