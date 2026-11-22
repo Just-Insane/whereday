@@ -37,6 +37,8 @@ A recognized response is HTTP 200 with JSON containing the matching `sha256`, an
 
 The sender pins the returned identity before the first POST and sends it as `X-Whereday-Export-ID`. A supporting receiver must reject a changed identity. Its successful POST response must return `status: accepted`, the matching digest and the same `capture.export_id`. An interrupted membership inventory may use HTTP 503 with `status: capture_membership_pending`, `export_id`, increasing `next_cursor`, stable `total` and `retry_same_original: true`. Its progress is saved, and every retry first checks the authenticated receipt again.
 
+The three `X-Whereday-Export-*` headers are reserved for this protocol and cannot also be selected as a custom authentication header.
+
 HTTP 404, 405 or 501 from the initial GET, or an ordinary HTTP 200 without the receipt protocol, permits the original POST behavior for a generic endpoint. If that POST has an uncertain result, the sender holds it: generic endpoints without a pinned receipt contract cannot automatically reconcile an unknown write. A changed account identity, mismatched digest, unavailable receipt or damaged local body also holds the request without a repeat or cursor advance. Clearing waiting points preserves an uncertain delivery; it is not silently discarded.
 
 ## Verification

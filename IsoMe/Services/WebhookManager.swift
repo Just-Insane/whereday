@@ -455,6 +455,9 @@ final class WebhookManager: ObservableObject {
 
     private func configuredRequest() throws -> URLRequest {
         guard let url = buildURL() else { throw WebhookError.invalidURL }
+        if authType == .customHeader && ["x-whereday-export-format", "x-whereday-export-id", "x-whereday-export-sha256"].contains(authKey.lowercased()) {
+            throw WebhookOutbox.QueueError.reservedAuthHeader
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue(format.mimeType, forHTTPHeaderField: "Content-Type")
