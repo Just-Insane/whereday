@@ -333,8 +333,9 @@ private struct MainTabView: View {
 
     @ViewBuilder
     private var mapWorkspace: some View {
-        // The Duo SDK ships with Swift 6.4; older SDKs cannot resolve ArrangementView.
-        #if compiler(>=6.4)
+        // Swift 6.4 can ship with the 27.0 SDK, which lacks the Duo APIs.
+        // The selected SDK condition preserves the existing older-SDK layout.
+        #if compiler(>=6.4) && !WHEREDAY_NO_DUO_SDK
         if #available(iOS 27.1, *) {
             DuoMapWorkspace(
                 viewModel: viewModel,
@@ -361,7 +362,7 @@ private struct MainTabView: View {
     /// Picking a day: the timeline, with the map beside it when the display is open.
     @ViewBuilder
     private var timelineWorkspace: some View {
-        #if compiler(>=6.4)
+        #if compiler(>=6.4) && !WHEREDAY_NO_DUO_SDK
         if #available(iOS 27.1, *) {
             DuoJournalWorkspace(viewModel: viewModel, onShowOnMap: showMap)
         } else {
@@ -528,7 +529,7 @@ private struct WheredayNavigationRail: View {
     }
 }
 
-#if compiler(>=6.4)
+#if compiler(>=6.4) && !WHEREDAY_NO_DUO_SDK
 /// The timeline, picked from the map: open, the map stays beside it as a companion and focuses each stay.
 /// System arrangements retain the primary screen while the inner display gains a companion,
 /// and keep each page clear of the active hinge without device-name or orientation checks.

@@ -504,11 +504,89 @@ final class WebhookManagerTests: XCTestCase {
         XCTAssertTrue(MockWebhookURLProtocol.requests.isEmpty)
     }
 
+    func testBacklogDrainsInBoundedBatchesWithoutAnotherLocationEvent() async throws {
+        for _ in 0..<3 { MockWebhookURLProtocol.enqueue(statusCode: 200) }
+        let manager = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        manager.urlString = "https://example.com/hooks/location"
+        manager.batchCount = 2
+        for index in 0..<5 { manager.enqueuePendingPoint(makePoint(latitude: Double(index))) }
+
+        await manager.flushBatch()
+
+        XCTAssertEqual(manager.queuedPointCount, 0)
+        let counts = try MockWebhookURLProtocol.postBodies.map {
+            (try JSONSerialization.jsonObject(with: $0) as? [String: Any])?["totalPoints"] as? Int
+        }
+        XCTAssertEqual(counts, [2, 2, 1])
+        XCTAssertFalse(manager.isSending)
+    }
+
+    func testSameMIMEFormatChangeDuringPreflightHoldsOriginalWithoutPost() async throws {
+        XCTAssertEqual(ExportFormat.json.mimeType, ExportFormat.owntracks.mimeType)
+        let started = expectation(description: "Receipt request started")
+        let release = DispatchSemaphore(value: 0)
+        MockWebhookURLProtocol.enqueueReceipt(status: "capture_pending")
+        MockWebhookURLProtocol.setBeforeResponse { request in
+            if request.httpMethod == "GET" {
+                started.fulfill()
+                _ = release.wait(timeout: .now() + 5)
+            }
+        }
+        let manager = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        manager.urlString = "https://example.com/hooks/location"
+        manager.enqueuePendingPoint(makePoint())
+        let send = Task { await manager.flushBatch() }
+        await fulfillment(of: [started], timeout: 3)
+
+        manager.format = .owntracks
+        XCTAssertEqual(manager.queuedPointCount, 0, "The new format must have a distinct queue binding")
+        release.signal()
+        await send.value
+
+        XCTAssertTrue(MockWebhookURLProtocol.postRequests.isEmpty)
+        XCTAssertNil(manager.lastSentAt)
+        manager.format = .json
+        XCTAssertEqual(manager.queuedPointCount, 1)
+        let prepared = try XCTUnwrap(WebhookOutbox(directory: outboxDirectory).read(for: outboxRequest()).prepared)
+        XCTAssertFalse(prepared.attempted)
+        XCTAssertNotNil(try JSONSerialization.jsonObject(with: prepared.body) as? [String: Any])
+    }
+
+    func testPointQueuedDuringGenericPreflightSurvivesAndDrainsInSameFlush() async {
+        let started = expectation(description: "First generic preflight started")
+        let release = DispatchSemaphore(value: 0)
+        var intercepted = false
+        MockWebhookURLProtocol.setBeforeResponse { request in
+            if request.httpMethod == "GET", !intercepted {
+                intercepted = true
+                started.fulfill()
+                _ = release.wait(timeout: .now() + 5)
+            }
+        }
+        MockWebhookURLProtocol.enqueue(statusCode: 200)
+        MockWebhookURLProtocol.enqueue(statusCode: 200)
+        let manager = makeWebhookManager(retryPolicy: .init(maxAttempts: 1, baseDelay: 0, multiplier: 1))
+        manager.urlString = "https://example.com/hooks/location"
+        manager.batchCount = 1
+        manager.enqueuePendingPoint(makePoint(latitude: 1))
+        let send = Task { await manager.flushBatch() }
+        await fulfillment(of: [started], timeout: 3)
+
+        manager.enqueuePendingPoint(makePoint(latitude: 2))
+        release.signal()
+        await send.value
+
+        XCTAssertEqual(MockWebhookURLProtocol.postRequests.count, 2)
+        XCTAssertEqual(manager.queuedPointCount, 0)
+        XCTAssertFalse(manager.isSending)
+    }
+
     private func outboxRequest() -> URLRequest {
         var request = URLRequest(url: URL(string: "https://example.com/hooks/location")!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("json", forHTTPHeaderField: "X-Whereday-Export-Format")
         return request
     }
 
@@ -586,6 +664,7 @@ private final class MockWebhookURLProtocol: URLProtocol {
     private static let lock = NSLock()
     private static var queuedResponses: [Response] = []
     private static var queuedReceipts: [Receipt] = []
+    private static var beforeResponse: ((URLRequest) -> Void)?
     private(set) static var requests: [URLRequest] = []
     private(set) static var requestBodies: [Data] = []
 
@@ -593,6 +672,7 @@ private final class MockWebhookURLProtocol: URLProtocol {
         lock.withLock {
             queuedResponses = []
             queuedReceipts = []
+            beforeResponse = nil
             requests = []
             requestBodies = []
         }
@@ -613,6 +693,10 @@ private final class MockWebhookURLProtocol: URLProtocol {
 
     static func enqueueError(_ code: URLError.Code) {
         lock.withLock { queuedResponses.append(Response(statusCode: 0, body: Data(), error: URLError(code))) }
+    }
+
+    static func setBeforeResponse(_ action: @escaping (URLRequest) -> Void) {
+        lock.withLock { beforeResponse = action }
     }
 
     static func enqueue(statusCode: Int, body: Data = Data()) {
@@ -651,6 +735,8 @@ private final class MockWebhookURLProtocol: URLProtocol {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }
+
+        Self.lock.withLock { Self.beforeResponse }?(request)
 
         if let error = next.error {
             client?.urlProtocol(self, didFailWithError: error)

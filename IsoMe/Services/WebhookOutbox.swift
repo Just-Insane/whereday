@@ -120,7 +120,7 @@ final class WebhookOutbox {
     }
 
     enum QueueError: LocalizedError {
-        case unavailable, changedDestination, recoveryUnavailable, busy, tooLarge, disabled, unsupportedVisits
+        case unavailable, changedDestination, recoveryUnavailable, busy, tooLarge, disabled, unsupportedVisits, reservedAuthHeader
         var errorDescription: String? {
             switch self {
             case .unavailable:
@@ -137,6 +137,8 @@ final class WebhookOutbox {
                 return "Webhook delivery is disabled. Pending work remains saved."
             case .unsupportedVisits:
                 return "This format supports location points only. Choose JSON, CSV, Markdown, GPX, KML or GeoJSON to send visits."
+            case .reservedAuthHeader:
+                return "Choose a different custom authentication header. X-Whereday-Export-Format, X-Whereday-Export-ID and X-Whereday-Export-SHA256 are reserved for delivery identity."
             }
         }
     }

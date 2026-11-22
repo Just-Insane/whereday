@@ -120,6 +120,7 @@ final class WebhookManager: ObservableObject {
     private let retryPolicy: RetryPolicy
     private let sleep: (TimeInterval) async -> Void
     private var isDraining = false
+    private var deliveryActive = false
 
     private enum DefaultsKey: String {
         case enabled, url, format, authType
@@ -295,9 +296,9 @@ final class WebhookManager: ObservableObject {
 
     private func drainPrepared() async throws {
         guard isEnabled else { throw WebhookOutbox.QueueError.disabled }
-        guard !isSending, !isDraining else { return }
-        isDraining = true
-        defer { isDraining = false }
+        guard !deliveryActive, !isDraining else { return }
+        isDraining = true; isSending = true
+        defer { isDraining = false; isSending = false; refreshQueue() }
         let request = try configuredRequest(), queue = try requiredOutbox()
         var visited = Set<String>()
         var firstFailure: Error?
@@ -320,6 +321,7 @@ final class WebhookManager: ObservableObject {
             } catch {
                 if firstFailure == nil { firstFailure = error }
             }
+            await Task.yield()
         }
         if try queue.damagedOperationCount(for: request) > 0, firstFailure == nil {
             firstFailure = WebhookOutbox.QueueError.unavailable
@@ -346,7 +348,7 @@ final class WebhookManager: ObservableObject {
 
     /// Send a manual export of all saved data.
     func sendNow() async {
-        guard let context = modelContainer?.mainContext else { return }
+        guard !isSending, let context = modelContainer?.mainContext else { return }
         do {
             let request = try configuredRequest()
             if try requiredOutbox().hasHistory(for: request) {
@@ -441,7 +443,7 @@ final class WebhookManager: ObservableObject {
     func sendPoints(_ points: [LocationPoint], visits: [Visit] = [], history: Bool = false) async throws {
         guard !points.isEmpty || !visits.isEmpty else { return }
         guard isEnabled else { throw WebhookOutbox.QueueError.disabled }
-        guard !isSending else { throw WebhookOutbox.QueueError.busy }
+        guard !deliveryActive, !isDraining else { throw WebhookOutbox.QueueError.busy }
         if points.isEmpty && (format == .owntracks || format == .overland) {
             throw WebhookOutbox.QueueError.unsupportedVisits
         }
@@ -455,9 +457,15 @@ final class WebhookManager: ObservableObject {
 
     private func configuredRequest() throws -> URLRequest {
         guard let url = buildURL() else { throw WebhookError.invalidURL }
+        if authType == .customHeader && ["x-whereday-export-format", "x-whereday-export-id", "x-whereday-export-sha256"].contains(authKey.lowercased()) {
+            throw WebhookOutbox.QueueError.reservedAuthHeader
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue(format.mimeType, forHTTPHeaderField: "Content-Type")
+        // JSON, OwnTracks and Overland can share a MIME type. Bind their
+        // distinct format tokens too, without storing a credential or endpoint.
+        request.setValue(format.token, forHTTPHeaderField: "X-Whereday-Export-Format")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("Whereday/\(AppInfo.version)", forHTTPHeaderField: "User-Agent")
         applyAuth(to: &request)
@@ -472,9 +480,10 @@ final class WebhookManager: ObservableObject {
     }
 
     private func deliverPrepared(request configured: URLRequest, maximumAttempts: Int? = nil) async throws {
-        guard !isSending else { throw WebhookOutbox.QueueError.busy }
+        guard !deliveryActive else { throw WebhookOutbox.QueueError.busy }
+        deliveryActive = true
         isSending = true
-        defer { isSending = false; refreshQueue() }
+        defer { deliveryActive = false; isSending = isDraining; refreshQueue() }
         let queue = try requiredOutbox()
         guard let original = try queue.read(for: configured).prepared else { return }
         let attempts = max(1, maximumAttempts ?? retryPolicy.maxAttempts)

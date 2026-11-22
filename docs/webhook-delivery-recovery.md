@@ -12,7 +12,7 @@ Visits-only exports are supported by JSON, CSV, Markdown, GPX, KML and GeoJSON. 
 
 New source points are queued even while another request is awaiting a response. Each drain round prepares fresh points first, selects pending operations by their newest native source time, and visits each operation once. Historical requests receive one recovery opportunity per round; an unresolved historical receipt remains intact while independent fresh envelopes proceed. App-active events, native saved-point observations and the existing batch timer resume this work; this adds no scheduler or background execution entitlement. A new manual history action resumes an existing prepared history snapshot instead of regenerating uncertain originals.
 
-Changing the endpoint, format or credentials does not send an older queue to the new configuration. Returning to the original settings makes its saved work available again. Disabling delivery retains the queue without sending it.
+Changing the endpoint, format or credentials does not send an older queue to the new configuration. The non-secret `X-Whereday-Export-Format` header identifies the format token explicitly, including formats that share a MIME type, and participates in the local binding. Returning to the original settings makes its saved work available again. Disabling delivery retains the queue without sending it.
 
 ## Optional receiver receipt contract
 
@@ -37,6 +37,8 @@ A recognized response is HTTP 200 with JSON containing the matching `sha256`, an
 
 The sender pins the returned identity before the first POST and sends it as `X-Whereday-Export-ID`. A supporting receiver must reject a changed identity. Its successful POST response must return `status: accepted`, the matching digest and the same `capture.export_id`. An interrupted membership inventory may use HTTP 503 with `status: capture_membership_pending`, `export_id`, increasing `next_cursor`, stable `total` and `retry_same_original: true`. Its progress is saved, and every retry first checks the authenticated receipt again.
 
+The three `X-Whereday-Export-*` headers are reserved for this protocol and cannot also be selected as a custom authentication header.
+
 HTTP 404, 405 or 501 from the initial GET, or an ordinary HTTP 200 without the receipt protocol, permits the original POST behavior for a generic endpoint. If that POST has an uncertain result, the sender holds it: generic endpoints without a pinned receipt contract cannot automatically reconcile an unknown write. A changed account identity, mismatched digest, unavailable receipt or damaged local body also holds the request without a repeat or cursor advance. Clearing waiting points preserves an uncertain delivery; it is not silently discarded.
 
 ## Verification
@@ -48,3 +50,5 @@ scripts/test-ios.sh -only-testing:IsoMeTests/WebhookManagerTests
 ```
 
 The suite uses isolated defaults, temporary queue storage and mocked HTTP. `WebhookContinuationTests` additionally covers lossless bounded partitioning, visits-only history, every chunk surviving restart, independent fresh priority while an older account-bound receipt remains unknown, and a crash between receipt settlement and cursor advancement. It covers visits-only delivery, persistent points/cursor, a lost acknowledgement without another POST, explicit identical-body continuation, changed account or credentials, damaged bytes, disabled delivery and generic unknown results. Passing these source tests is separate from installing a signed app and observing a genuine phone export.
+
+The app's optional iOS 27.1 arrangement/hinge layouts require their SDK symbols as well as runtime availability. App builds selecting the iPhoneOS or iPhone Simulator 27.0 SDK define `WHEREDAY_NO_DUO_SDK` and use the existing fallback layouts. The newer layouts and their runtime guards remain available with supported newer SDKs; a compiler version alone does not prove those SDK symbols exist. This compatibility condition leaves normal simulator signing and other targets unchanged.

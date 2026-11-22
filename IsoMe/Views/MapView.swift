@@ -5796,7 +5796,7 @@ enum MapPointMarkerSampler {
     }
 }
 
-#if compiler(>=6.4)
+#if compiler(>=6.4) && !WHEREDAY_NO_DUO_SDK
 /// Reports the hinge as soon as the view joins a window: `UIHingeInteraction` calls its handler with
 /// the initial state, so a foldable is recognised at launch even while it is closed.
 @available(iOS 27.1, *)
